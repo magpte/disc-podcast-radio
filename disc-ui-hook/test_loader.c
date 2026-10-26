@@ -3,7 +3,7 @@ typedef int ssize_t;
 
 #define RTLD_LAZY   0x0001
 #define RTLD_NOW    0x0002
-#define RTLD_GLOBAL 0x0100
+#define RTLD_GLOBAL 0x0004
 
 extern void *dlopen(const char *filename, int flags);
 extern void *dlsym(void *handle, const char *symbol);

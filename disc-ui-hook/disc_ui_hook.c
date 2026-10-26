@@ -3,7 +3,7 @@
  * Cross-compiled for MIPS32 little-endian (mipsel-linux-gnu, glibc 2.29, o32 ABI)
  */
 
-#define UI_HOOK_VERSION "1.0.7"
+#define UI_HOOK_VERSION "1.0.8"
 
 typedef unsigned int size_t;
 typedef int ssize_t;
@@ -11,7 +11,7 @@ typedef int pid_t;
 
 #define RTLD_LAZY   0x0001
 #define RTLD_NOW    0x0002
-#define RTLD_GLOBAL 0x0100
+#define RTLD_GLOBAL 0x0004
 
 /* MIPS Linux open() flags */
 #define O_RDONLY    0x0000
