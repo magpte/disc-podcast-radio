@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>FiiO DISC - 播客与网络收音机控制台</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+          </svg>
+        </div>
+        <div>
+          <h1 class="header-title">DISC 控制台</h1>
+          <p class="header-subtitle">网络收音机 &amp; 泛用型播客</p>
+        </div>
+      </div>
+      <div class="header-status">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-text" id="status-text">连接就绪</span>
+      </div>
+    </header>
+
+    <!-- Top Tabs Navigation -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" id="tab-radio-btn" onclick="switchTab('radio')">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="2"></circle>
+          <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
+        </svg>
+        网络电台
+      </button>
+      <button class="tab-btn" id="tab-podcast-btn" onclick="switchTab('podcast')">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+          <line x1="12" x2="12" y1="19" y2="22"></line>
+        </svg>
+        播客订阅
+      </button>
+      <button class="tab-btn" id="tab-downloads-btn" onclick="switchTab('downloads')">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" x2="12" y1="15" y2="3"></line>
+        </svg>
+        TF卡下载
+      </button>
+      <button class="tab-btn" id="tab-diagnostics-btn" onclick="switchTab('diagnostics')">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 12h4l2-6 4 12 2-6h6"></path>
+        </svg>
+        诊断日志
+      </button>
+    </nav>
+
+    <!-- TAB 1: 网络电台 -->
+    <main class="tab-content active" id="tab-radio">
+      <div class="search-section">
+        <div class="search-bar">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="radio-search-input" placeholder="搜索全球电台 (如: 音乐之声, 爵士, BBC)...">
+          <button class="btn-primary" onclick="searchRadio()">搜索</button>
+        </div>
+        <div class="category-chips" id="radio-categories">
+          <button class="chip active" data-cat="全部">全部</button>
+        </div>
+        <div class="on-device-tip">
+          TF 卡【流媒体下载/网络电台】已按分类生成 M3U，可直接在播放器本地浏览；播客在【流媒体下载/播客】。
+        </div>
+      </div>
+
+      <section class="section-title">
+        <h2 id="radio-section-heading">全部电台</h2>
+        <span class="count-badge" id="radio-count">0 个</span>
+      </section>
+      <div class="stations-grid" id="stations-list">
+        <!-- Rendered by JS -->
+      </div>
+    </main>
+
+    <!-- TAB 2: 播客订阅 -->
+    <main class="tab-content" id="tab-podcast">
+      <div class="search-section">
+        <div class="subscribe-bar">
+          <input type="text" id="podcast-url-input" placeholder="输入播客 RSS/Atom 订阅链接（XML）...">
+          <button class="btn-primary" id="podcast-subscribe-btn" onclick="subscribePodcast()">+ 添加订阅</button>
+        </div>
+      </div>
+
+      <section class="section-title">
+        <h2>我的播客订阅</h2>
+      </section>
+      <div class="podcasts-grid" id="podcasts-list">
+        <!-- Rendered by JS -->
+      </div>
+
+      <div class="episodes-view" id="episodes-view" style="display: none;">
+        <div class="episodes-header">
+          <button class="btn-back" onclick="closeEpisodes()">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+            返回播客列表
+          </button>
+          <div class="feed-summary" id="feed-summary"></div>
+        </div>
+        <div class="episodes-list" id="episodes-list"></div>
+      </div>
+    </main>
+
+    <!-- TAB 3: TF卡下载管理 -->
+    <main class="tab-content" id="tab-downloads">
+      <section class="section-title">
+        <h2>TF 卡离线下载</h2>
+        <span class="count-badge">自动存入【流媒体下载/播客】</span>
+      </section>
+      <div class="downloads-container" id="downloads-list">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" x2="12" y1="15" y2="3"></line>
+          </svg>
+          <p>暂无正在下载的任务</p>
+          <span>在播客单集列表中点击【⬇ 下载到 TF 卡】，可在无 Wi-Fi 时脱机收听。</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- TAB 4: 诊断日志 -->
+    <main class="tab-content" id="tab-diagnostics">
+      <section class="section-title">
+        <h2>运行诊断与日志</h2>
+        <span class="count-badge">无需 SSH</span>
+      </section>
+      <div class="diag-actions">
+        <button class="btn-primary" id="diag-refresh-btn">刷新状态</button>
+        <button class="btn-secondary" id="diag-discover-btn">重新发现播放器</button>
+        <button class="btn-secondary" id="diag-probe-btn">深度检测播放器</button>
+        <button class="btn-secondary" id="diag-playlists-btn">重建播放列表</button>
+        <button class="btn-secondary" id="diag-db-btn">导出播放器数据库</button>
+        <button class="btn-secondary" id="diag-copy-btn">复制诊断</button>
+      </div>
+      <div class="renderer-override">
+        <div class="renderer-override-text">
+          <label for="renderer-location">播放器地址（留空自动发现）</label>
+          <span>一般填 http://127.0.0.1:1286/description.xml；也可填 http://设备IP:1286/。</span>
+        </div>
+        <input id="renderer-location" type="text" autocomplete="off" placeholder="http://127.0.0.1:1286/description.xml">
+        <button class="btn-secondary" id="renderer-save-btn">保存并连接</button>
+        <button class="btn-secondary" id="renderer-clear-btn">恢复自动发现</button>
+      </div>
+      <div class="debug-summary" id="debug-summary">
+        <span class="diag-badge">正在读取…</span>
+      </div>
+      <div class="diag-grid">
+        <div class="diag-panel">
+          <h3>调试状态 JSON</h3>
+          <pre class="debug-json" id="debug-json">点击「刷新状态」读取播放器、代理、播放列表和缓存信息。</pre>
+        </div>
+        <div class="diag-panel">
+          <div class="logs-header">
+            <h3>最近日志</h3>
+            <div class="logs-controls">
+              <select id="log-level">
+                <option value="">全部</option>
+                <option value="info">INFO+</option>
+                <option value="warn">WARN+</option>
+                <option value="error">ERROR</option>
+              </select>
+              <button class="btn-small btn-secondary" id="logs-refresh-btn">刷新</button>
+              <button class="btn-small btn-secondary" id="logs-copy-btn">复制日志</button>
+              <button class="btn-small btn-secondary" id="logs-clear-btn">清空</button>
+            </div>
+          </div>
+          <div class="logs-meta" id="logs-meta"></div>
+          <div class="logs-list" id="logs-list">
+            <div class="empty-state"><p>暂无日志</p><span>播放或发现播放器时会产生日志</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="on-device-tip">
+        若播放器找不到刚生成的目录，请在播放器里重新扫描 TF 卡或重启一次。日志同时写入服务数据目录的 service.log。
+      </div>
+    </main>
+
+    <!-- Custom Radio Modal -->
+    <div class="modal-overlay" id="add-radio-modal" style="display: none;">
+      <div class="modal-card">
+        <h3>添加自定义电台</h3>
+        <div class="form-group">
+          <label>电台名称</label>
+          <input type="text" id="custom-radio-name" placeholder="如: 私人音乐台">
+        </div>
+        <div class="form-group">
+          <label>直播流地址 (M3U8 / AAC / MP3)</label>
+          <input type="text" id="custom-radio-url" placeholder="http://.../live.m3u8">
+        </div>
+        <div class="form-group">
+          <label>分类标签</label>
+          <input type="text" id="custom-radio-cat" placeholder="如: 私人收藏" value="我的收藏">
+        </div>
+        <div class="modal-actions">
+          <button class="btn-secondary" onclick="closeAddRadioModal()">取消</button>
+          <button class="btn-primary" onclick="submitCustomRadio()">保存添加</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating Mini Player Dock -->
+    <div class="player-dock" id="player-dock">
+      <div class="dock-cover" id="dock-cover">📻</div>
+      <div class="dock-info">
+        <div class="dock-title" id="dock-title">FiiO DISC 就绪</div>
+        <div class="dock-subtitle" id="dock-subtitle">点击任意电台或播客开始在播放器收听</div>
+      </div>
+      <div class="dock-actions">
+        <button class="btn-play-toggle" id="dock-play-btn" onclick="togglePlayback()">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

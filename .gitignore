@@ -1,0 +1,40 @@
+# Compiled Object and Executable files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.a
+
+# Project specific compiled binaries
+disc-podcast-radio/disc-podcast-radio
+disc-podcast-radio/disc-podcast-radio.exe
+disc-podcast-radio/module-ui.so
+test_loader
+
+# Go artifacts
+*.test
+*.prof
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Output directories
+build/
+dist/
