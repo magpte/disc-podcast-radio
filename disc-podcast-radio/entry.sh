@@ -332,6 +332,10 @@ if [ "$revert" = 0 ]; then
   deploy_ui || true
 fi
 
+# Ensure hook log file exists on TF card and sync from /tmp
+touch /tmp/sdcard/disc-ui-hook.log 2>/dev/null || true
+[ ! -f /tmp/disc-ui-hook.log ] || cat /tmp/disc-ui-hook.log >>/tmp/sdcard/disc-ui-hook.log 2>/dev/null || true
+
 # --- Start daemon ---
 echo "starting: ./disc-podcast-radio -port 8888 -data $data_dir" >>"$log_file" 2>&1 || true
 chmod 755 ./disc-podcast-radio 2>/dev/null || true

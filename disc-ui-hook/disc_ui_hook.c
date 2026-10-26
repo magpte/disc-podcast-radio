@@ -48,7 +48,10 @@ static void write_file(const char *path, const char *msg, size_t len) {
 static void log_append(const char *msg) {
     size_t len = 0;
     while (msg[len]) len++;
+    /* Write to RAM */
     write_file("/tmp/disc-ui-hook.log", msg, len);
+    /* Write to TF card for direct user inspection */
+    write_file("/tmp/sdcard/disc-ui-hook.log", msg, len);
 }
 
 /* Original dlopen handle */
@@ -64,8 +67,16 @@ void *disc_hwaccel_get_api(int ver) {
     return (void*)0;
 }
 
-/* mq_ui function pointers */
-typedef void* (*lv_list_add_btn_t)(void *list, const void *img, const char *text, void *callback, void *extra);
+/*
+ * mq_ui function pointers
+ * Note: In mq_ui 0x00485ef8, calling convention is:
+ *   a0: list (void*)
+ *   a1: text (const char*)   <-- CRITICAL: a1 is text string!
+ *   a2: img / index (void*)
+ *   a3: callback (void*)
+ *   16(sp): extra (void*)
+ */
+typedef void* (*lv_list_add_btn_t)(void *list, const char *text, const void *img, void *callback, void *extra);
 static lv_list_add_btn_t lv_list_add_btn = (lv_list_add_btn_t)0x00485ef8;
 
 typedef void (*lv_list_clean_t)(void *list);
@@ -95,7 +106,7 @@ static dlna_enter_native_t dlna_enter_native = (dlna_enter_native_t)0x0046f29c;
 /* --- Menu State & Data Models --- */
 
 typedef enum {
-    MENU_MAIN = 0,         /* 主流媒体：播客、网络收音机、网易云、QQ、酷狗 */
+    MENU_MAIN = 0,         /* 主流媒体：原生保留网易云、QQ、酷狗，并追加播客、收音机 */
     MENU_PODCAST_FEEDS,    /* 播客列表：日谈公园、机核 GCORES 等 */
     MENU_PODCAST_EPS,      /* 播客单集：展示选中播客各期 */
     MENU_RADIO_CATS,       /* 电台分类：国家台、省市台、网络台 */
@@ -132,6 +143,8 @@ static int g_item_count = 0;
 
 static menu_state_t g_current_menu = MENU_MAIN;
 static void *g_active_list = (void*)0;
+static void *g_podcast_btn = (void*)0;
+static void *g_radio_btn = (void*)0;
 static int g_selected_feed = 0;
 static int g_selected_radio_cat = 0;
 static char g_playing_title[80] = {0};
@@ -191,9 +204,9 @@ typedef struct {
 } podcast_feed_data_t;
 
 static const episode_data_t g_ritan_eps[] = {
-    {"日谈公园: 最新一期", "https://feed.xyzfm.space/v44s9u2yv67z"},
-    {"日谈公园: 往期精彩 A", "https://feed.xyzfm.space/v44s9u2yv67z"},
-    {"日谈公园: 往期精彩 B", "https://feed.xyzfm.space/v44s9u2yv67z"},
+    {"日谈公园: 最新精选节目", "https://feed.xyzfm.space/m4n6775z661p"},
+    {"日谈物语: 悬疑历史故事", "https://feed.xyzfm.space/m4n6775z661p"},
+    {"日谈公园: 音乐与生活对话", "https://feed.xyzfm.space/m4n6775z661p"},
 };
 
 static const episode_data_t g_gcores_eps[] = {
@@ -223,22 +236,26 @@ static void send_play_command(const char *type, const char *title, const char *u
         write(fd, buf, len);
         close(fd);
     }
-    /* Record currently playing title */
     strncpy(g_playing_title, title, sizeof(g_playing_title) - 1);
     g_playing_title[sizeof(g_playing_title) - 1] = '\0';
 }
 
-/* Forward declaration */
+/* Forward declarations */
 static void btn_event_cb(void *e);
-static void render_menu(void *list);
+static void render_sub_menu(void *list);
 
-static void add_btn(void *list, const char *text, action_type_t action, int idx, const char *url) {
-    if (g_item_count >= MAX_ITEMS) return;
+static void* add_btn(void *list, const char *text, action_type_t action, int idx, const char *url) {
+    if (g_item_count >= MAX_ITEMS) return (void*)0;
 
-    /* Add button to LVGL list */
-    lv_list_add_btn(list, (void*)0, text, (void*)btn_event_cb, (void*)0);
+    /* In mq_ui: a0=list, a1=text, a2=img/index, a3=callback, 16(sp)=extra */
+    lv_list_add_btn(list, text, (void*)0, (void*)btn_event_cb, (void*)0);
     void *btn = lv_list_get_btn(list, -1);
-    if (!btn) return;
+    if (!btn) {
+        log_append("[disc-ui-hook] lv_list_get_btn failed for: ");
+        log_append(text);
+        log_append("\n");
+        return (void*)0;
+    }
 
     lv_btn_set_state(btn, 0x4000);
     lv_obj_set_event_cb(btn, (void*)btn_event_cb, 0x21, (void*)0); /* catch delete */
@@ -253,6 +270,12 @@ static void add_btn(void *list, const char *text, action_type_t action, int idx,
         g_items[g_item_count].url[0] = '\0';
     }
     g_item_count++;
+
+    log_append("[disc-ui-hook] Added btn: ");
+    log_append(text);
+    log_append("\n");
+
+    return btn;
 }
 
 /* Try loading dynamic episodes from /tmp/disc-podcast-radio/episodes.txt */
@@ -295,7 +318,6 @@ static int load_dynamic_episodes(void *list, const char *target_feed) {
                 char *t = line;
                 char *u = sep + 1;
                 while (*u == ' ') u++;
-                /* Strip trailing whitespace from t */
                 int tlen = 0; while (t[tlen]) tlen++;
                 while (tlen > 0 && (t[tlen-1] == ' ' || t[tlen-1] == '\r')) { t[tlen-1] = '\0'; tlen--; }
 
@@ -308,23 +330,18 @@ static int load_dynamic_episodes(void *list, const char *target_feed) {
     return count;
 }
 
-static void render_menu(void *list) {
+static void render_sub_menu(void *list) {
     if (!list || !lv_obj_valid(list)) return;
 
-    /* Clean all items */
+    /* Clean all items for sub-menu */
     lv_list_clean(list);
     g_item_count = 0;
+    g_podcast_btn = (void*)0;
+    g_radio_btn = (void*)0;
 
     switch (g_current_menu) {
-    case MENU_MAIN:
-        add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
-        add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
-        add_btn(list, "网易云音乐", ACT_NETEASE, 0, "");
-        add_btn(list, "QQ音乐", ACT_QQ, 0, "");
-        add_btn(list, "酷狗音乐", ACT_KUGOU, 0, "");
-        break;
-
     case MENU_PODCAST_FEEDS:
+        log_append("[disc-ui-hook] Rendering MENU_PODCAST_FEEDS\n");
         add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)PODCAST_COUNT; i++) {
             add_btn(list, g_podcasts[i].feed_title, ACT_SELECT_FEED, i, "");
@@ -332,12 +349,11 @@ static void render_menu(void *list) {
         break;
 
     case MENU_PODCAST_EPS:
+        log_append("[disc-ui-hook] Rendering MENU_PODCAST_EPS\n");
         add_btn(list, "< 返回播客列表", ACT_BACK_TO_PODCASTS, 0, "");
         if (g_selected_feed >= 0 && g_selected_feed < (int)PODCAST_COUNT) {
             const podcast_feed_data_t *f = &g_podcasts[g_selected_feed];
-            /* Try dynamic episodes first */
             if (!load_dynamic_episodes(list, f->feed_title)) {
-                /* Fallback to static episodes */
                 for (int i = 0; i < f->ep_count; i++) {
                     add_btn(list, f->episodes[i].title, ACT_PLAY_EPISODE, i, f->episodes[i].url);
                 }
@@ -346,6 +362,7 @@ static void render_menu(void *list) {
         break;
 
     case MENU_RADIO_CATS:
+        log_append("[disc-ui-hook] Rendering MENU_RADIO_CATS\n");
         add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)RADIO_CAT_COUNT; i++) {
             add_btn(list, g_radio_cats[i].cat_name, ACT_SELECT_RADIO_CAT, i, "");
@@ -353,6 +370,7 @@ static void render_menu(void *list) {
         break;
 
     case MENU_RADIO_STATIONS:
+        log_append("[disc-ui-hook] Rendering MENU_RADIO_STATIONS\n");
         add_btn(list, "< 返回电台分类", ACT_BACK_TO_RADIO_CATS, 0, "");
         if (g_selected_radio_cat >= 0 && g_selected_radio_cat < (int)RADIO_CAT_COUNT) {
             const radio_cat_data_t *cat = &g_radio_cats[g_selected_radio_cat];
@@ -361,7 +379,25 @@ static void render_menu(void *list) {
             }
         }
         break;
+
+    default:
+        break;
     }
+}
+
+static void restore_main_menu(void *list) {
+    if (!list || !lv_obj_valid(list)) return;
+    lv_list_clean(list);
+    g_item_count = 0;
+    g_podcast_btn = (void*)0;
+    g_radio_btn = (void*)0;
+
+    log_append("[disc-ui-hook] Restoring main streaming menu\n");
+    add_btn(list, "网易云音乐", ACT_NETEASE, 0, "");
+    add_btn(list, "QQ音乐", ACT_QQ, 0, "");
+    add_btn(list, "酷狗音乐", ACT_KUGOU, 0, "");
+    g_podcast_btn = add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
+    g_radio_btn = add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
 }
 
 static void btn_event_cb(void *e) {
@@ -370,6 +406,19 @@ static void btn_event_cb(void *e) {
 
     /* Event 7 = LV_EVENT_CLICKED */
     if (code == 7) {
+        /* Direct checks for podcast and radio main buttons */
+        if (target == g_podcast_btn) {
+            log_append("[disc-ui-hook] Clicked: 播客 (v1.0.6)\n");
+            g_current_menu = MENU_PODCAST_FEEDS;
+            render_sub_menu(g_active_list);
+            return;
+        } else if (target == g_radio_btn) {
+            log_append("[disc-ui-hook] Clicked: 网络收音机 (v1.0.6)\n");
+            g_current_menu = MENU_RADIO_CATS;
+            render_sub_menu(g_active_list);
+            return;
+        }
+
         for (int i = 0; i < g_item_count; i++) {
             if (target == g_items[i].btn) {
                 action_type_t act = g_items[i].action;
@@ -377,19 +426,24 @@ static void btn_event_cb(void *e) {
 
                 switch (act) {
                 case ACT_GO_PODCASTS:
+                    log_append("[disc-ui-hook] ACT_GO_PODCASTS\n");
                     g_current_menu = MENU_PODCAST_FEEDS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_GO_RADIOS:
+                    log_append("[disc-ui-hook] ACT_GO_RADIOS\n");
                     g_current_menu = MENU_RADIO_CATS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_SELECT_FEED:
+                    log_append("[disc-ui-hook] ACT_SELECT_FEED: ");
+                    log_append(g_items[i].label);
+                    log_append("\n");
                     g_selected_feed = idx;
                     g_current_menu = MENU_PODCAST_EPS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_PLAY_EPISODE:
@@ -400,9 +454,12 @@ static void btn_event_cb(void *e) {
                     break;
 
                 case ACT_SELECT_RADIO_CAT:
+                    log_append("[disc-ui-hook] ACT_SELECT_RADIO_CAT: ");
+                    log_append(g_items[i].label);
+                    log_append("\n");
                     g_selected_radio_cat = idx;
                     g_current_menu = MENU_RADIO_STATIONS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_PLAY_STATION:
@@ -413,29 +470,35 @@ static void btn_event_cb(void *e) {
                     break;
 
                 case ACT_BACK_TO_MAIN:
+                    log_append("[disc-ui-hook] ACT_BACK_TO_MAIN\n");
                     g_current_menu = MENU_MAIN;
-                    render_menu(g_active_list);
+                    restore_main_menu(g_active_list);
                     break;
 
                 case ACT_BACK_TO_PODCASTS:
+                    log_append("[disc-ui-hook] ACT_BACK_TO_PODCASTS\n");
                     g_current_menu = MENU_PODCAST_FEEDS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_BACK_TO_RADIO_CATS:
+                    log_append("[disc-ui-hook] ACT_BACK_TO_RADIO_CATS\n");
                     g_current_menu = MENU_RADIO_CATS;
-                    render_menu(g_active_list);
+                    render_sub_menu(g_active_list);
                     break;
 
                 case ACT_NETEASE:
+                    log_append("[disc-ui-hook] ACT_NETEASE\n");
                     dlna_enter_native(1);
                     break;
 
                 case ACT_QQ:
+                    log_append("[disc-ui-hook] ACT_QQ\n");
                     dlna_enter_native(2);
                     break;
 
                 case ACT_KUGOU:
+                    log_append("[disc-ui-hook] ACT_KUGOU\n");
                     dlna_enter_native(3);
                     break;
 
@@ -448,6 +511,11 @@ static void btn_event_cb(void *e) {
     }
     /* Event 0x21 (33) = LV_EVENT_DELETE */
     else if (code == 0x21) {
+        if (target == g_podcast_btn) {
+            g_podcast_btn = (void*)0;
+        } else if (target == g_radio_btn) {
+            g_radio_btn = (void*)0;
+        }
         for (int i = 0; i < g_item_count; i++) {
             if (target == g_items[i].btn) {
                 g_items[i].btn = (void*)0;
@@ -473,13 +541,29 @@ static int my_pc_usleep(unsigned int usec) {
             if (list != g_active_list) {
                 g_active_list = list;
                 g_current_menu = MENU_MAIN;
-                render_menu(list);
+                g_podcast_btn = (void*)0;
+                g_radio_btn = (void*)0;
+                g_item_count = 0;
+                log_append("[disc-ui-hook] Streaming list detected at 0x8de1b0\n");
+            }
+
+            /* In MENU_MAIN, append 播客 and 网络收音机 to native list */
+            if (g_current_menu == MENU_MAIN) {
+                if (!g_podcast_btn) {
+                    g_podcast_btn = add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
+                }
+                if (!g_radio_btn) {
+                    g_radio_btn = add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
+                }
             }
         } else {
             /* Left streaming view, reset active list */
             if (g_active_list != (void*)0) {
+                log_append("[disc-ui-hook] Left streaming view, reset active list\n");
                 g_active_list = (void*)0;
                 g_current_menu = MENU_MAIN;
+                g_podcast_btn = (void*)0;
+                g_radio_btn = (void*)0;
                 g_item_count = 0;
             }
         }
