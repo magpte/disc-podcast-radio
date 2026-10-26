@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	appVersion = "1.0.4"
+	appVersion = "1.0.6"
 	appName    = "DISC Podcast & Radio"
 	userAgent  = "Mozilla/5.0 (Linux; FiiO DISC) DISC-Podcast-Radio/" + appVersion
 )

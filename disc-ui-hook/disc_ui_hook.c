@@ -317,15 +317,15 @@ static void render_menu(void *list) {
 
     switch (g_current_menu) {
     case MENU_MAIN:
-        add_btn(list, "播客", ACT_GO_PODCASTS, 0, "");
-        add_btn(list, "网络收音机", ACT_GO_RADIOS, 0, "");
+        add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
+        add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
         add_btn(list, "网易云音乐", ACT_NETEASE, 0, "");
         add_btn(list, "QQ音乐", ACT_QQ, 0, "");
         add_btn(list, "酷狗音乐", ACT_KUGOU, 0, "");
         break;
 
     case MENU_PODCAST_FEEDS:
-        add_btn(list, "< 返回流媒体", ACT_BACK_TO_MAIN, 0, "");
+        add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)PODCAST_COUNT; i++) {
             add_btn(list, g_podcasts[i].feed_title, ACT_SELECT_FEED, i, "");
         }
@@ -346,7 +346,7 @@ static void render_menu(void *list) {
         break;
 
     case MENU_RADIO_CATS:
-        add_btn(list, "< 返回流媒体", ACT_BACK_TO_MAIN, 0, "");
+        add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)RADIO_CAT_COUNT; i++) {
             add_btn(list, g_radio_cats[i].cat_name, ACT_SELECT_RADIO_CAT, i, "");
         }
@@ -499,7 +499,7 @@ void __attribute__((constructor)) disc_ui_hook_init(void) {
     }
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "[disc-ui-hook] Pure text menu hook init in PID %d, exe: %s\n", (int)getpid(), exe_buf);
+    snprintf(buf, sizeof(buf), "[disc-ui-hook] Pure text menu hook v1.0.6 init in PID %d, exe: %s\n", (int)getpid(), exe_buf);
     log_append(buf);
 
     if (strcmp(exe_buf, "/usr/bin/mq_ui") != 0 && strcmp(exe_buf, "/usr/data/mq_ui") != 0) {
