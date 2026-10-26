@@ -3,6 +3,8 @@
  * Cross-compiled for MIPS32 little-endian (mipsel-linux-gnu, glibc 2.29, o32 ABI)
  */
 
+#define UI_HOOK_VERSION "1.0.7"
+
 typedef unsigned int size_t;
 typedef int ssize_t;
 typedef int pid_t;
@@ -342,7 +344,7 @@ static void render_sub_menu(void *list) {
     switch (g_current_menu) {
     case MENU_PODCAST_FEEDS:
         log_append("[disc-ui-hook] Rendering MENU_PODCAST_FEEDS\n");
-        add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
+        add_btn(list, "< 返回流媒体 (v" UI_HOOK_VERSION ")", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)PODCAST_COUNT; i++) {
             add_btn(list, g_podcasts[i].feed_title, ACT_SELECT_FEED, i, "");
         }
@@ -363,7 +365,7 @@ static void render_sub_menu(void *list) {
 
     case MENU_RADIO_CATS:
         log_append("[disc-ui-hook] Rendering MENU_RADIO_CATS\n");
-        add_btn(list, "< 返回流媒体 (v1.0.6)", ACT_BACK_TO_MAIN, 0, "");
+        add_btn(list, "< 返回流媒体 (v" UI_HOOK_VERSION ")", ACT_BACK_TO_MAIN, 0, "");
         for (int i = 0; i < (int)RADIO_CAT_COUNT; i++) {
             add_btn(list, g_radio_cats[i].cat_name, ACT_SELECT_RADIO_CAT, i, "");
         }
@@ -396,8 +398,8 @@ static void restore_main_menu(void *list) {
     add_btn(list, "网易云音乐", ACT_NETEASE, 0, "");
     add_btn(list, "QQ音乐", ACT_QQ, 0, "");
     add_btn(list, "酷狗音乐", ACT_KUGOU, 0, "");
-    g_podcast_btn = add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
-    g_radio_btn = add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
+    g_podcast_btn = add_btn(list, "播客 (v" UI_HOOK_VERSION ")", ACT_GO_PODCASTS, 0, "");
+    g_radio_btn = add_btn(list, "网络收音机 (v" UI_HOOK_VERSION ")", ACT_GO_RADIOS, 0, "");
 }
 
 static void btn_event_cb(void *e) {
@@ -550,10 +552,10 @@ static int my_pc_usleep(unsigned int usec) {
             /* In MENU_MAIN, append 播客 and 网络收音机 to native list */
             if (g_current_menu == MENU_MAIN) {
                 if (!g_podcast_btn) {
-                    g_podcast_btn = add_btn(list, "播客 (v1.0.6)", ACT_GO_PODCASTS, 0, "");
+                    g_podcast_btn = add_btn(list, "播客 (v" UI_HOOK_VERSION ")", ACT_GO_PODCASTS, 0, "");
                 }
                 if (!g_radio_btn) {
-                    g_radio_btn = add_btn(list, "网络收音机 (v1.0.6)", ACT_GO_RADIOS, 0, "");
+                    g_radio_btn = add_btn(list, "网络收音机 (v" UI_HOOK_VERSION ")", ACT_GO_RADIOS, 0, "");
                 }
             }
         } else {
@@ -583,7 +585,7 @@ void __attribute__((constructor)) disc_ui_hook_init(void) {
     }
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "[disc-ui-hook] Pure text menu hook v1.0.6 init in PID %d, exe: %s\n", (int)getpid(), exe_buf);
+    snprintf(buf, sizeof(buf), "[disc-ui-hook] Pure text menu hook v" UI_HOOK_VERSION " init in PID %d, exe: %s\n", (int)getpid(), exe_buf);
     log_append(buf);
 
     if (strcmp(exe_buf, "/usr/bin/mq_ui") != 0 && strcmp(exe_buf, "/usr/data/mq_ui") != 0) {
