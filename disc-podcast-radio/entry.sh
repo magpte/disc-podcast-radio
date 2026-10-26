@@ -37,6 +37,23 @@ fi
   fi
 } >>"$log_file" 2>&1 || true
 
+# Prune older releases in NAND to prevent reaching the 3-release threshold
+releases_dir=/usr/data/disc-runtime/components/disc-podcast-radio/releases
+if [ -d "$releases_dir" ]; then
+  cur_ver=$(cat MODULE_VERSION 2>/dev/null || true)
+  for old_rel in "$releases_dir"/*; do
+    if [ -d "$old_rel" ]; then
+      old_bn="${old_rel##*/}"
+      if [ "$old_bn" != "$cur_ver" ]; then
+        prev_link=$(readlink /usr/data/disc-runtime/components/disc-podcast-radio/previous 2>/dev/null || true)
+        if [ "$prev_link" != "releases/$old_bn" ] && [ "$prev_link" != "$old_rel" ]; then
+          rm -rf "$old_rel" 2>/dev/null || true
+        fi
+      fi
+    fi
+  done
+fi
+
 log() { printf '[disc-podcast-radio] %s\n' "$*" >>"$log_file" 2>/dev/null || true; }
 sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
