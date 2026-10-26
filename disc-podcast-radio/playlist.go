@@ -365,3 +365,38 @@ func removeEmptyDirs(dir, stop string) {
 		_ = os.Remove(dir)
 	}
 }
+
+// cleanupLegacyPlaceholders 安全清理旧版本遗留在 TF 卡上的占位符 MP3 和历史 M3U 播放列表。
+// 仅清理 .disc-placeholders 目录与 .m3u 文件，绝不触碰用户下载的真实播客音频（位于 播客/ 目录）。
+func (a *App) cleanupLegacyPlaceholders() {
+	if !tfCardMounted() {
+		return
+	}
+	base := "/tmp/sdcard/流媒体下载"
+	if st, err := os.Stat(base); err != nil || !st.IsDir() {
+		return
+	}
+
+	phDir := filepath.Join(base, ".disc-placeholders")
+	if st, err := os.Stat(phDir); err == nil && st.IsDir() {
+		a.log.Infof("[LegacyCleanup] 检测到旧版本占位音频目录，正在安全清理: %s", phDir)
+		_ = os.RemoveAll(phDir)
+	}
+
+	entries, err := os.ReadDir(base)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".m3u") {
+				_ = os.Remove(filepath.Join(base, e.Name()))
+			}
+		}
+	}
+
+	// 清理仅用于 M3U 的网络电台子目录
+	radioDir := filepath.Join(base, "网络电台")
+	if st, err := os.Stat(radioDir); err == nil && st.IsDir() {
+		_ = os.RemoveAll(radioDir)
+	}
+
+	a.log.Infof("[LegacyCleanup] 历史 M3U 播放列表与占位符已清理完毕，已完全运行在原生流媒体屏幕UI模式。")
+}

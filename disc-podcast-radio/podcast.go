@@ -496,13 +496,6 @@ func (a *App) FetchPodcastEpisodes(ctx context.Context, feedURL string, force bo
 		}
 	}
 	a.mu.Unlock()
-	if updated {
-		go func() {
-			if err := a.buildPlaylists("播客刷新: " + feed.Title); err != nil {
-				a.log.Warnf("更新播客播放列表失败: %v", err)
-			}
-		}()
-	}
 	return cloneFeed(feed), nil
 }
 

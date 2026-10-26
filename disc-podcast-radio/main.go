@@ -371,20 +371,20 @@ func (a *App) Init() error {
 	}
 
 	a.loadSettings()
-	a.playlistRoot = a.detectPlaylistRoot()
 	a.log.Infof("%s %s 启动，端口 %d，数据目录 %s", appName, appVersion, a.port, a.dataDir)
-	a.log.Infof("播放列表目录: %s，媒体登记 %d 条，电台 %d 个，播客 %d 个", a.playlistRoot, len(a.media), len(a.stations), len(a.podcasts))
+	a.log.Infof("运行模式: 原生流媒体屏幕UI交互模式 (免TF卡占位符I/O)，媒体登记 %d 条，电台 %d 个，播客 %d 个", len(a.media), len(a.stations), len(a.podcasts))
 
-	if err := a.buildPlaylists("启动"); err != nil {
-		a.log.Warnf("启动时生成播放列表失败: %v", err)
-	}
+	// 异步安全清理历史版本可能残留在 TF 卡上的 .disc-placeholders 和历史 .m3u
+	go a.cleanupLegacyPlaceholders()
 
 	go a.discoveryLoop()
 	go a.statusPollLoop()
-	go a.localPlaybackLoop()
+	// 已改用流媒体屏幕UI原生点播，不再需要高频扫描fd寻找打开的静音占位符
+	// go a.localPlaybackLoop()
 	go a.maintenanceLoop()
 	go a.startupTasks()
 	go a.startOnlineIPC()
+	go a.commandListenerLoop()
 	return nil
 }
 
@@ -590,13 +590,77 @@ func (a *App) startupTasks() {
 			continue
 		}
 		a.log.Infof("后台刷新内置播客《%s》完成，%d 集", feed.Title, len(feed.Episodes))
-		if err := a.buildPlaylists("后台刷新《" + feed.Title + "》后"); err != nil {
-			a.log.Warnf("刷新播客后生成播放列表失败: %v", err)
+	}
+	a.exportEpisodesText()
+	a.log.Infof("内置播客后台刷新完毕，已通过流媒体屏幕UI及Web就绪。")
+}
+
+func (a *App) commandListenerLoop() {
+	cmdDir := "/tmp/disc-podcast-radio"
+	cmdFile := filepath.Join(cmdDir, "play_cmd")
+	_ = os.MkdirAll(cmdDir, 0755)
+
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastCmd string
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			data, err := os.ReadFile(cmdFile)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			text := strings.TrimSpace(string(data))
+			if text == "" || text == lastCmd {
+				continue
+			}
+			lastCmd = text
+			_ = os.Remove(cmdFile)
+
+			parts := strings.Split(text, "\t")
+			if len(parts) >= 3 {
+				playType := parts[0]
+				title := parts[1]
+				url := parts[2]
+				a.log.Infof("[ScreenUI] 收到屏幕纯文字点击播放指令: type=%s title=%s url=%s", playType, title, url)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					if err := a.PlayStream(ctx, url, title, "正在播放", "", playType); err != nil {
+						a.log.Errorf("[ScreenUI] 播放失败: %v", err)
+					}
+				}()
+			}
 		}
 	}
-	if err := a.buildPlaylists("后台刷新播客后"); err != nil {
-		a.log.Warnf("生成播客播放列表失败: %v", err)
+}
+
+func (a *App) exportEpisodesText() {
+	cmdDir := "/tmp/disc-podcast-radio"
+	_ = os.MkdirAll(cmdDir, 0755)
+	txtFile := filepath.Join(cmdDir, "episodes.txt")
+
+	a.mu.RLock()
+	podcasts := append([]PodcastFeed(nil), a.podcasts...)
+	a.mu.RUnlock()
+
+	var sb strings.Builder
+	for _, f := range podcasts {
+		sb.WriteString(fmt.Sprintf("[%s]\n", f.Title))
+		for i, ep := range f.Episodes {
+			if i >= 15 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("%s | %s\n", ep.Title, ep.AudioURL))
+		}
 	}
+
+	_ = os.WriteFile(txtFile+".next", []byte(sb.String()), 0644)
+	_ = os.Rename(txtFile+".next", txtFile)
 }
 
 func (a *App) Close() {

@@ -298,6 +298,8 @@ deploy_ui() {
     ui_pid=$(pidof mq_ui 2>/dev/null || true)
     if [ -n "$ui_pid" ]; then
       log "restarting mq_ui to load the new module"
+      sync 2>/dev/null || true
+      sleep 1
       kill -TERM $ui_pid 2>/dev/null || true
     fi
   fi

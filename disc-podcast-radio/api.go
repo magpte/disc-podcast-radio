@@ -224,7 +224,6 @@ func (a *App) handleRadioAdd(w http.ResponseWriter, r *http.Request) {
 			station = a.stations[i]
 			_ = a.persistStationsLocked()
 			a.mu.Unlock()
-			go a.rebuildPlaylistsSafe("添加/更新电台")
 			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "station": station, "updated": true})
 			return
 		}
@@ -239,7 +238,6 @@ func (a *App) handleRadioAdd(w http.ResponseWriter, r *http.Request) {
 	_ = a.persistStationsLocked()
 	a.mu.Unlock()
 	a.log.Infof("添加电台: %s (%s) %s", station.Name, station.Category, station.URL)
-	go a.rebuildPlaylistsSafe("添加电台")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "station": station, "updated": false})
 }
 
@@ -274,7 +272,6 @@ func (a *App) handleRadioDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "没有找到该电台"})
 		return
 	}
-	go a.rebuildPlaylistsSafe("删除电台")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
@@ -365,9 +362,6 @@ func (a *App) handlePodcastSubscribe(w http.ResponseWriter, r *http.Request) {
 	_ = a.persistPodcastsLocked()
 	a.mu.Unlock()
 	a.log.Infof("订阅播客: 《%s》 %s (%d 集)", feed.Title, feed.URL, len(feed.Episodes))
-	if err := a.buildPlaylists("订阅播客"); err != nil {
-		a.log.Warnf("订阅后生成播放列表失败: %v", err)
-	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"podcast": PodcastSummary{
@@ -436,7 +430,6 @@ func (a *App) handlePodcastDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "没有找到该订阅"})
 		return
 	}
-	go a.rebuildPlaylistsSafe("删除播客")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
@@ -754,21 +747,15 @@ func (a *App) handlePlaylistsBuild(w http.ResponseWriter, r *http.Request) {
 	if !onlyMethods(w, r, http.MethodPost) {
 		return
 	}
-	if err := a.buildPlaylists("手动重建"); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": err.Error()})
-		return
-	}
-	a.mu.RLock()
-	count := len(a.playlistFiles)
-	built := a.playlistsBuilt
-	a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "count": count, "built": built, "root": a.playlistRoot})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "已完全切换为原生流媒体屏幕UI模式，无需向TF卡生成M3U播放列表与占位音频",
+		"count":   0,
+	})
 }
 
 func (a *App) rebuildPlaylistsSafe(reason string) {
-	if err := a.buildPlaylists(reason); err != nil {
-		a.log.Warnf("重建播放列表失败(%s): %v", reason, err)
-	}
+	// 已切换为流媒体原生UI选择模式，避免向脆弱的 FAT32 TF 卡频繁写入占位符与播放列表
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
