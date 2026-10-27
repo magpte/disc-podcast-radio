@@ -45,8 +45,8 @@ func (a *App) startOnlineIPC() {
 	ipcMgr.app = a
 	_ = os.MkdirAll(onlineMusicDir, 0755)
 
-	a.log.Infof("流媒体屏幕交互 IPC 服务已启动 (监听 %s)", onlineReqFile)
-	go ipcMgr.requestLoop()
+	// Keep nowPlayingLoop for updating nowplaying info, but avoid stealing /tmp/disc-online-music/request
+	// as pure text menu uses /tmp/disc-podcast-radio/play_cmd directly.
 	go ipcMgr.nowPlayingLoop()
 }
 

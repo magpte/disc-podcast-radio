@@ -4,6 +4,12 @@ set -eu
 umask 077
 cd "$(dirname "$0")"
 
+# Safe mode immediate bypass: if DISC_MODULES_SAFE_MODE is present on TF card, exit immediately
+if [ -f /tmp/sdcard/DISC_MODULES_SAFE_MODE ]; then
+  echo "[disc-podcast-radio] DISC_MODULES_SAFE_MODE active; skipping startup." >/tmp/sdcard/disc-podcast-radio-startup.log 2>&1 || true
+  exit 0
+fi
+
 data_dir=/usr/data/disc-runtime/module-data/disc-podcast-radio
 mkdir -p "$data_dir" 2>/dev/null || true
 
@@ -332,9 +338,18 @@ if [ "$revert" = 0 ]; then
   deploy_ui || true
 fi
 
-# Ensure hook log file exists on TF card and sync from /tmp
+# Ensure hook log file exists on TF card and sync from /tmp in background
 touch /tmp/sdcard/disc-ui-hook.log 2>/dev/null || true
-[ ! -f /tmp/disc-ui-hook.log ] || cat /tmp/disc-ui-hook.log >>/tmp/sdcard/disc-ui-hook.log 2>/dev/null || true
+(
+  while true; do
+    sleep 3
+    if [ -f /tmp/disc-ui-hook.log ] && [ -d /tmp/sdcard ]; then
+      cp -f /tmp/disc-ui-hook.log /tmp/sdcard/disc-ui-hook.log 2>/dev/null || true
+    fi
+  done
+) &
+SYNC_PID=$!
+trap 'kill $SYNC_PID 2>/dev/null || true' EXIT INT TERM
 
 # --- Start daemon ---
 echo "starting: ./disc-podcast-radio -port 8888 -data $data_dir" >>"$log_file" 2>&1 || true

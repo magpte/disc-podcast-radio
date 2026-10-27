@@ -173,49 +173,9 @@ var (
 	lastPlayerWakeMu   sync.Mutex
 )
 
-// wakePlayerDLNA sends IPC commands to mq_player via /player POSIX message queue
-// to transition the player into Mode 5 (DLNA/gmediarender mode).
+// wakePlayerDLNA is a no-op because mq_ui owns input mode switching and native IPC.
+// Sending raw bytes to /dev/mqueue/player corrupts the player queue and causes panics.
 func (a *App) wakePlayerDLNA() error {
-	lastPlayerWakeMu.Lock()
-	now := time.Now()
-	// Debounce waking so rapid calls within 2.5 seconds don't saturate the queue.
-	if now.Sub(lastPlayerWakeTime) < 2500*time.Millisecond {
-		lastPlayerWakeMu.Unlock()
-		return nil
-	}
-	lastPlayerWakeTime = now
-	lastPlayerWakeMu.Unlock()
-
-	var errs []string
-
-	// 1. Send wake ping & switch to DLNA mode via POSIX message queue /player
-	// Message 1: "0666000C0004" (Wake / UI activate signal)
-	_ = sendPOSIXMessageQueue("/player", "0666000C0004")
-	time.Sleep(40 * time.Millisecond)
-
-	// Message 2: "0657000C000C" (Module 06, cmd 57, length 12, param 12 -> Mode 5: DLNA)
-	if err := sendPOSIXMessageQueue("/player", "0657000C000C"); err != nil {
-		errs = append(errs, fmt.Sprintf("POSIX MQ: %v", err))
-		a.log.Warnf("向 /player 发送 DLNA 切换指令遇到错误: %v", err)
-	} else {
-		a.log.Infof("已成功向 /player 队列发送 DLNA 切换指令 (0657000C000C)")
-	}
-
-	// 2. Direct file write fallback to /dev/mqueue/player if accessible
-	if f, err := os.OpenFile("/dev/mqueue/player", os.O_WRONLY, 0); err == nil {
-		_, _ = f.Write([]byte("0666000C0004"))
-		time.Sleep(30 * time.Millisecond)
-		_, _ = f.Write([]byte("0657000C000C"))
-		_ = f.Close()
-		a.log.Debugf("已向 /dev/mqueue/player 文件写入切换指令")
-	}
-
-	// 3. Touch runtime state file
-	_ = os.WriteFile("/tmp/disc-runtime/dlna-transport.state", []byte("1\n"), 0644)
-
-	if len(errs) > 0 && !hasMQueuePlayer() {
-		return errors.New(strings.Join(errs, "; "))
-	}
 	return nil
 }
 
@@ -226,62 +186,39 @@ func hasMQueuePlayer() bool {
 
 func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
 	deadline := time.Now().Add(timeout)
-	var lastErr error
-	woken := false
 	for {
 		if r := a.currentRenderer(); r != nil {
 			if time.Since(r.LastSeen) < rendererStaleAfter {
 				return r, nil
 			}
-			// Validate a stale entry rather than trusting it forever.
-			ctx, cancel := context.WithTimeout(a.ctx, 3*time.Second)
+			ctx, cancel := context.WithTimeout(a.ctx, 1500*time.Millisecond)
 			_, err := a.getTransportInfo(ctx, r)
 			cancel()
 			if err == nil {
 				a.touchRenderer(r)
 				return r, nil
 			}
-			lastErr = err
-			a.log.Warnf("旧 renderer 无响应，重新发现: %v", err)
-		}
-
-		if !woken {
-			woken = true
-			if err := a.wakePlayerDLNA(); err != nil {
-				a.log.Warnf("尝试自动唤醒 mq_player (DLNA模式): %v", err)
-			}
-			// Give mq_player and gmediarender a moment to bind port and advertise
-			select {
-			case <-a.ctx.Done():
-				return nil, a.ctx.Err()
-			case <-time.After(700 * time.Millisecond):
-			}
 		}
 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			if lastErr == nil {
-				lastErr = errors.New("没有找到 mq_player 的 UPnP AVTransport 服务")
-			}
-			return nil, lastErr
+			return nil, errors.New("没有找到 FiiO DISC 本机的 UPnP AVTransport 服务")
 		}
-		if remaining > 5*time.Second {
-			remaining = 5 * time.Second
+		if remaining > 2*time.Second {
+			remaining = 2 * time.Second
 		}
 		ctx, cancel := context.WithTimeout(a.ctx, remaining)
-		r, err := a.discoverRenderer(ctx)
+		r, _ := a.discoverRenderer(ctx)
 		cancel()
 		if r != nil {
 			a.setRenderer(r)
 			return r, nil
 		}
-		if err != nil {
-			lastErr = err
-		}
+
 		select {
 		case <-a.ctx.Done():
 			return nil, a.ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(150 * time.Millisecond):
 		}
 	}
 }
@@ -298,14 +235,98 @@ func (a *App) touchRenderer(r *RendererInfo) {
 	a.rendererMu.Unlock()
 }
 
+func (a *App) discoverControlOnce(ctx context.Context) (string, error) {
+	// Stock renderer binds the Wi-Fi address and rotates ports on re-entry.
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	var ip string
+	if wifi, err := net.InterfaceByName("wlan0"); err == nil {
+		if wifiAddrs, err := wifi.Addrs(); err == nil {
+			addrs = wifiAddrs
+		}
+	}
+	for _, addr := range addrs {
+		if n, ok := addr.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLoopback() {
+			ip = n.IP.String()
+			break
+		}
+	}
+	if ip == "" {
+		return "", errors.New("请先连接 Wi-Fi")
+	}
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
+		deadline = until
+	}
+	_ = conn.SetDeadline(deadline)
+
+	dst, err := net.ResolveUDPAddr("udp4", ip+":1900")
+	if err != nil {
+		return "", err
+	}
+	msg := "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+	_, _ = conn.WriteTo([]byte(msg), dst)
+
+	buf := make([]byte, 4096)
+	for {
+		n, peer, err := conn.ReadFrom(buf)
+		if err != nil {
+			return "", errors.New("接收服务尚未就绪，请稍后再试")
+		}
+		host, _, _ := net.SplitHostPort(peer.String())
+		if host != ip {
+			continue
+		}
+		for _, line := range strings.Split(string(buf[:n]), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(strings.ToLower(line), "location:") {
+				continue
+			}
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			u, err := url.Parse(strings.TrimSpace(parts[1]))
+			if err == nil && u.Hostname() == ip && u.Scheme == "http" {
+				return "http://" + u.Host + "/upnp/control/rendertransport1", nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+	}
+}
+
 func (a *App) discoverRenderer(ctx context.Context) (*RendererInfo, error) {
 	a.discoverMu.Lock()
 	defer a.discoverMu.Unlock()
 
+	// 1. First and most reliable: Stock FiiO DISC direct unicast SSDP to local Wi-Fi IP:1900
+	if control, err := a.discoverControlOnce(ctx); err == nil && control != "" {
+		r := &RendererInfo{
+			ControlURL:   control,
+			FriendlyName: "FiiO DISC Renderer",
+			ModelName:    "X2000",
+			Source:       "stock-unicast",
+			LastSeen:     time.Now(),
+		}
+		return r, nil
+	}
+
 	var errs []string
 
-	// A user-provided address takes precedence. This is the escape hatch when a
-	// firmware build binds the UPnP server to an unusual address or path.
+	// 2. User-provided address takes precedence
 	if override := strings.TrimSpace(a.rendererOverride()); override != "" {
 		candidates := []rendererCandidate{{
 			URL: override, Source: "manual", Timeout: 3 * time.Second, Priority: 0,
@@ -317,6 +338,7 @@ func (a *App) discoverRenderer(ctx context.Context) (*RendererInfo, error) {
 		errs = append(errs, "手动地址: "+rendererAttemptSummary(attempts, override))
 	}
 
+	// 3. Fallback to local listening ports
 	if r, err := a.discoverLocal(ctx); r != nil {
 		return r, nil
 	} else if err != nil {

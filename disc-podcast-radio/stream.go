@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -361,22 +362,22 @@ func didlMetadata(title, artist, album, cover, mediaURL, contentType string) str
 	if title == "" {
 		title = "DISC 流媒体"
 	}
+	mime := "audio/mpeg"
+	if contentType != "" && contentType != "application/octet-stream" {
+		mime = contentType
+	}
 	var b strings.Builder
 	b.WriteString(`<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">`)
-	b.WriteString(`<item id="disc-stream" parentID="-1" restricted="1">`)
+	b.WriteString(`<item id="online" parentID="0" restricted="1">`)
 	b.WriteString("<dc:title>" + xmlEscape(title) + "</dc:title>")
 	if artist != "" {
 		b.WriteString("<upnp:artist>" + xmlEscape(artist) + "</upnp:artist>")
-		b.WriteString("<dc:creator>" + xmlEscape(artist) + "</dc:creator>")
 	}
-	if album != "" {
-		b.WriteString("<upnp:album>" + xmlEscape(album) + "</upnp:album>")
-	}
-	b.WriteString("<upnp:class>object.item.audioItem</upnp:class>")
+	b.WriteString("<upnp:class>object.item.audioItem.musicTrack</upnp:class>")
 	if cover != "" && (strings.HasPrefix(cover, "http://") || strings.HasPrefix(cover, "https://")) {
 		b.WriteString("<upnp:albumArtURI>" + xmlEscape(cover) + "</upnp:albumArtURI>")
 	}
-	b.WriteString(`<res protocolInfo="` + xmlEscape(protocolInfoFor(contentType)) + `">` + xmlEscape(mediaURL) + `</res>`)
+	b.WriteString(`<res protocolInfo="http-get:*:` + mime + `:*" duration="0:00:00">` + xmlEscape(mediaURL) + `</res>`)
 	b.WriteString(`</item></DIDL-Lite>`)
 	return b.String()
 }
@@ -632,30 +633,46 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
 
-	probeCtx, probeCancel := context.WithTimeout(ctx, 25*time.Second)
+	// Fast probe (3 seconds timeout), fallback to URL ext MIME if timed out or failed
+	probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
 	probe, err := a.probeStream(probeCtx, streamURL)
 	probeCancel()
-	if err != nil {
-		msg := "音频源不可用: " + err.Error()
-		a.setStatusError(msg)
-		a.setLastStreamError(msg)
-		return errors.New(msg)
+	ext := "mp3"
+	ct := "audio/mpeg"
+	format := ""
+	resolvedURL := streamURL
+	if err == nil && probe != nil {
+		if probe.Ext != "" {
+			ext = probe.Ext
+		}
+		if probe.ContentType != "" {
+			ct = probe.ContentType
+		}
+		format = probe.Format
+		if probe.FinalURL != "" {
+			resolvedURL = probe.FinalURL
+		}
+	} else {
+		if uExt := extFromURL(streamURL); uExt != "" {
+			ext = uExt
+			ct = mimeForExt(ext)
+		}
 	}
 
-	entry := a.registerMedia(mediaType, stableHash(streamURL, 20), streamURL, title, subtitle, cover, probe.Ext, probe.ContentType, probe.Format)
+	entry := a.registerMedia(mediaType, stableHash(streamURL, 20), streamURL, title, subtitle, cover, ext, ct, format)
 	a.mu.Lock()
 	if old, ok := a.media[entry.Token]; ok {
-		old.ResolvedURL = probe.FinalURL
-		old.ContentType = probe.ContentType
-		old.Ext = probe.Ext
-		old.Format = probe.Format
+		old.ResolvedURL = resolvedURL
+		old.ContentType = ct
+		old.Ext = ext
+		old.Format = format
 		c := *old
 		entry = &c
 	}
 	a.mu.Unlock()
 	_ = a.saveMedia()
 
-	r, err := a.ensureRenderer(9 * time.Second)
+	r, err := a.ensureRenderer(8 * time.Second)
 	if err != nil {
 		msg := "未找到播放器: " + err.Error()
 		a.setStatusError(msg)
@@ -666,18 +683,15 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	proxyURL := a.mediaProxyURL(entry)
 	a.mu.Lock()
 	a.status.ProxyURL = proxyURL
-	a.status.ContentType = probe.ContentType
+	a.status.ContentType = ct
 	a.mu.Unlock()
 
-	// Stop whatever is currently playing. Errors here are not fatal (the
-	// renderer may already be stopped), but are useful in the log.
-	stopCtx, stopCancel := context.WithTimeout(ctx, 3*time.Second)
-	if err := a.stopRenderer(stopCtx, r); err != nil {
-		a.log.Debugf("播放前 Stop 忽略错误: %v", err)
-	}
+	// Stop whatever is currently playing
+	stopCtx, stopCancel := context.WithTimeout(ctx, 2*time.Second)
+	_ = a.stopRenderer(stopCtx, r)
 	stopCancel()
 
-	meta := didlMetadata(title, subtitle, album, cover, proxyURL, probe.ContentType)
+	meta := didlMetadata(title, subtitle, album, cover, proxyURL, ct)
 	setCtx, setCancel := context.WithTimeout(ctx, 6*time.Second)
 	err = a.setAVTransportURI(setCtx, r, proxyURL, meta)
 	setCancel()
@@ -694,19 +708,17 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		return errors.New(msg)
 	}
 
-	playCtx, playCancel := context.WithTimeout(ctx, 5*time.Second)
+	playCtx, playCancel := context.WithTimeout(ctx, 6*time.Second)
 	err = a.rendererPlay(playCtx, r)
 	playCancel()
 	if err != nil {
-		msg := "启动播放失败: " + err.Error()
-		a.setStatusError(msg)
-		a.setLastStreamError(msg)
-		return errors.New(msg)
+		a.log.Warnf("启动播放遇到连接断开，重试 Play: %v", err)
+		retryPlayCtx, retryPlayCancel := context.WithTimeout(ctx, 6*time.Second)
+		err = a.rendererPlay(retryPlayCtx, r)
+		retryPlayCancel()
 	}
-
-	state, err := a.waitForPlayback(ctx, r, proxyURL)
 	if err != nil {
-		msg := "播放器未进入播放状态: " + err.Error()
+		msg := "启动播放失败: " + err.Error()
 		a.setStatusError(msg)
 		a.setLastStreamError(msg)
 		return errors.New(msg)
@@ -715,65 +727,50 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.mu.Lock()
 	a.status.Playing = true
 	a.status.Error = ""
-	a.status.RendererState = state
+	a.status.RendererState = "PLAYING"
 	a.status.RendererURI = proxyURL
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
-	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s", title, subtitle, r.FriendlyName, proxyURL)
+
+	// Mark online streaming active so LCD sleep and power management stay alive
+	_ = os.MkdirAll("/tmp/disc-online-music", 0755)
+	_ = os.WriteFile("/tmp/disc-online-music/active", []byte("1\n"), 0644)
+	_ = os.WriteFile("/tmp/disc-online-music/session", []byte("1\n"), 0644)
+	nowPlayingContent := fmt.Sprintf("1\tPLAYING\torder\t0\t0\tauto\t%s\t44100\t16\t0\n%s\n%s\n%s\n\n\n",
+		strings.ToUpper(ext), title, subtitle, album)
+	_ = os.WriteFile("/tmp/disc-online-music/nowplaying", []byte(nowPlayingContent), 0644)
+
+	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s", title, subtitle, r.ControlURL, proxyURL)
 	return nil
 }
 
-func (a *App) waitForPlayback(ctx context.Context, r *RendererInfo, proxyURL string) (string, error) {
-	var lastState string
-	var lastErr error
-	retried := false
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
+// waitForPlayback checks if renderer enters PLAYING non-destructively for placeholder or transition checks
+func (a *App) waitForPlayback(ctx context.Context, r *RendererInfo, expectedURI string) (string, error) {
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(3 * time.Second)
+	lastState := "TRANSITIONING"
+	for {
 		select {
 		case <-ctx.Done():
 			return lastState, ctx.Err()
-		case <-time.After(700 * time.Millisecond):
-		}
-		qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		vals, err := a.getTransportInfo(qctx, r)
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		lastState = vals["CurrentTransportState"]
-		switch lastState {
-		case "PLAYING":
+		case <-timeout:
 			return lastState, nil
-		case "TRANSITIONING":
-			continue
-		case "STOPPED", "NO_MEDIA_PRESENT":
-			if !retried {
-				retried = true
-				a.log.Warnf("renderer 初次启动为 %s，重试一次 SetAVTransportURI + Play", lastState)
-				rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
-				_ = a.stopRenderer(rctx, r)
-				cs := a.getStatus()
-				meta := didlMetadata(cs.Title, cs.SubTitle, albumForType(cs.Type), cs.Cover, proxyURL, cs.ContentType)
-				if e := a.setAVTransportURI(rctx, r, proxyURL, meta); e != nil {
-					lastErr = e
-				} else if e := a.rendererPlay(rctx, r); e != nil {
-					lastErr = e
+		case <-ticker.C:
+			qctx, qcancel := context.WithTimeout(ctx, 800*time.Millisecond)
+			info, err := a.getTransportInfo(qctx, r)
+			qcancel()
+			if err == nil && info != nil {
+				st := info["CurrentTransportState"]
+				if st != "" {
+					lastState = st
+					if st == "PLAYING" {
+						return "PLAYING", nil
+					}
 				}
-				rcancel()
-				time.Sleep(1200 * time.Millisecond)
-				continue
 			}
-			return lastState, fmt.Errorf("renderer 状态 %s", lastState)
 		}
 	}
-	if lastState == "" && lastErr != nil {
-		return lastState, lastErr
-	}
-	if lastState == "" {
-		lastState = "UNKNOWN"
-	}
-	return lastState, fmt.Errorf("renderer 状态 %s", lastState)
 }
 
 func (a *App) StopPlay() error {
@@ -783,6 +780,8 @@ func (a *App) StopPlay() error {
 	a.status.RendererState = "STOPPED"
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
+
+	_ = os.Remove("/tmp/disc-online-music/active")
 
 	r := a.currentRenderer()
 	if r == nil {
