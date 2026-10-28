@@ -10,7 +10,7 @@
  * 5. Full support for DISC_MODULES_SAFE_MODE bypass.
  */
 
-#define UI_HOOK_VERSION "1.0.10"
+#define UI_HOOK_VERSION "1.2.2"
 
 typedef unsigned int size_t;
 typedef int ssize_t;

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -108,7 +109,7 @@ func (it *rssItem) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 			case "summary":
 				_ = d.DecodeElement(&it.Summary, &t)
 			case "encoded":
-				_ = d.DecodeElement(&it.Encoded, &t)
+				_ = d.Skip()
 			case "pubDate", "published", "updated":
 				var v string
 				if err := d.DecodeElement(&v, &t); err == nil {
@@ -174,6 +175,171 @@ type atomEntry struct {
 }
 
 // --- Feed parsing ---
+
+func parseFeedStream(r io.Reader, feedURL string, maxItems int) (*PodcastFeed, error) {
+	if maxItems <= 0 {
+		maxItems = 60
+	}
+	br := bufio.NewReaderSize(r, 64<<10)
+	peek, _ := br.Peek(512)
+	lowerPeek := strings.ToLower(string(peek))
+	if strings.Contains(lowerPeek, "<!doctype html") || strings.Contains(lowerPeek, "<html") {
+		return nil, errors.New("订阅地址返回网页而不是 XML 播客源")
+	}
+
+	dec := xml.NewDecoder(br)
+	dec.Strict = false
+	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		enc, err := htmlindex.Get(charset)
+		if err != nil {
+			return input, nil
+		}
+		return transform.NewReader(input, enc.NewDecoder()), nil
+	}
+
+	feed := &PodcastFeed{
+		Episodes:    make([]PodcastItem, 0, maxItems),
+		LastUpdated: time.Now().Format("2006-01-02 15:04"),
+	}
+
+	inChannel := false
+	inFeed := false
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) || len(feed.Episodes) > 0 {
+				break
+			}
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "channel":
+				inChannel = true
+			case "feed":
+				inFeed = true
+			case "title":
+				if (inChannel || inFeed) && feed.Title == "" {
+					_ = dec.DecodeElement(&feed.Title, &t)
+					feed.Title = strings.TrimSpace(feed.Title)
+				}
+			case "description", "subtitle":
+				if (inChannel || inFeed) && feed.Description == "" {
+					var desc string
+					_ = dec.DecodeElement(&desc, &t)
+					feed.Description = cleanHTML(desc)
+				}
+			case "image", "logo", "icon":
+				if (inChannel || inFeed) && feed.Cover == "" {
+					for _, attr := range t.Attr {
+						if attr.Name.Local == "href" && attr.Value != "" {
+							feed.Cover = strings.TrimSpace(attr.Value)
+						}
+					}
+					if feed.Cover == "" {
+						var img struct {
+							URL  string `xml:"url"`
+							Href string `xml:"href,attr"`
+						}
+						if err := dec.DecodeElement(&img, &t); err == nil {
+							if img.Href != "" {
+								feed.Cover = strings.TrimSpace(img.Href)
+							} else {
+								feed.Cover = strings.TrimSpace(img.URL)
+							}
+						}
+					}
+				}
+			case "author":
+				if (inChannel || inFeed) && feed.Author == "" {
+					var aut string
+					_ = dec.DecodeElement(&aut, &t)
+					feed.Author = strings.TrimSpace(aut)
+				}
+			case "item":
+				var it rssItem
+				if err := dec.DecodeElement(&it, &t); err == nil {
+					audio := itemAudioURL(it)
+					if audio != "" {
+						guid := strings.TrimSpace(it.GUID)
+						if guid == "" {
+							guid = audio
+						}
+						desc := it.Description
+						if strings.TrimSpace(desc) == "" {
+							desc = it.Summary
+						}
+						if feed.Cover == "" {
+							for _, img := range it.Images {
+								if img.Href != "" {
+									feed.Cover = img.Href
+									break
+								}
+								if img.URL != "" {
+									feed.Cover = img.URL
+									break
+								}
+							}
+						}
+						feed.Episodes = append(feed.Episodes, PodcastItem{
+							ID:          "ep_" + stableHash(guid, 16),
+							Title:       strings.TrimSpace(it.Title),
+							AudioURL:    resolveURL(feedURL, audio),
+							PubDate:     formatDate(it.PubDate),
+							Duration:    formatDuration(it.Duration),
+							Description: cleanHTML(desc),
+							FileSize:    it.Enclosure.Length,
+						})
+						if len(feed.Episodes) >= maxItems {
+							goto done
+						}
+					}
+				}
+			case "entry":
+				var ent atomEntry
+				if err := dec.DecodeElement(&ent, &t); err == nil {
+					var audio string
+					for _, l := range ent.Links {
+						if strings.EqualFold(l.Rel, "enclosure") && looksAudioURL(l.Href, l.Type) {
+							audio = strings.TrimSpace(l.Href)
+							break
+						}
+					}
+					if audio != "" {
+						guid := strings.TrimSpace(ent.ID)
+						if guid == "" {
+							guid = audio
+						}
+						desc := ent.Summary
+						if strings.TrimSpace(desc) == "" {
+							desc = ent.Content
+						}
+						feed.Episodes = append(feed.Episodes, PodcastItem{
+							ID:          "ep_" + stableHash(guid, 16),
+							Title:       strings.TrimSpace(ent.Title),
+							AudioURL:    resolveURL(feedURL, audio),
+							PubDate:     formatDate(ent.Published),
+							Description: cleanHTML(desc),
+						})
+						if len(feed.Episodes) >= maxItems {
+							goto done
+						}
+					}
+				}
+			}
+		}
+	}
+done:
+	if feed.Title == "" && len(feed.Episodes) == 0 {
+		return nil, errors.New("未能从流中解析到频道信息或单集")
+	}
+	if feed.Title == "" {
+		feed.Title = "未命名播客"
+	}
+	return feed, nil
+}
 
 func parseFeedDocument(body []byte) (*PodcastFeed, error) {
 	body = bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
@@ -426,30 +592,60 @@ func (a *App) FetchPodcastEpisodes(ctx context.Context, feedURL string, force bo
 	}
 	if !force {
 		a.feedMu.Lock()
-		if c, ok := a.feedCache[feedURL]; ok && time.Since(c.at) < 2*time.Minute {
+		if c, ok := a.feedCache[feedURL]; ok && time.Since(c.at) < 1*time.Hour {
 			cp := cloneFeed(c.feed)
 			a.feedMu.Unlock()
 			return cp, nil
 		}
 		a.feedMu.Unlock()
+
+		a.mu.RLock()
+		for i := range a.podcasts {
+			if a.podcasts[i].URL == feedURL && len(a.podcasts[i].Episodes) > 0 {
+				cp := cloneFeed(&a.podcasts[i])
+				a.mu.RUnlock()
+				a.feedMu.Lock()
+				a.feedCache[feedURL] = cachedFeed{feed: cloneFeed(cp), at: time.Now()}
+				a.feedMu.Unlock()
+				return cp, nil
+			}
+		}
+		a.mu.RUnlock()
 	}
 
 	a.log.Infof("开始解析播客订阅: %s", feedURL)
 	start := time.Now()
-	body, ct, err := a.fetchBytes(ctx, feedURL, 16<<20)
-	if err != nil {
-		return nil, fmt.Errorf("下载订阅源失败: %w", err)
-	}
-	if strings.Contains(strings.ToLower(ct), "text/html") {
-		trim := bytes.TrimSpace(body)
-		if !bytes.HasPrefix(trim, []byte("<?xml")) && !bytes.HasPrefix(trim, []byte("<rss")) && !bytes.HasPrefix(trim, []byte("<feed")) {
-			return nil, errors.New("订阅地址返回网页而不是 RSS/Atom，请填写播客 XML 链接")
-		}
-	}
-	feed, err := parseFeedDocument(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, application/atom+xml, */*")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("下载订阅源失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("订阅源返回 HTTP %d", resp.StatusCode)
+	}
+
+	feed, err := parseFeedStream(resp.Body, feedURL, 60)
+	if err != nil || feed == nil || len(feed.Episodes) == 0 {
+		a.log.Warnf("流式解析未获取到单集，尝试全量解析: %v", err)
+		body, _, err2 := a.fetchBytes(ctx, feedURL, 16<<20)
+		if err2 != nil {
+			return nil, fmt.Errorf("全量下载失败: %w", err2)
+		}
+		feed, err = parseFeedDocument(body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	feed.URL = feedURL
 	feed.ID = "pod_" + stableHash(feedURL, 12)
 	feed.Title = strings.TrimSpace(feed.Title)
@@ -496,6 +692,11 @@ func (a *App) FetchPodcastEpisodes(ctx context.Context, feedURL string, force bo
 		}
 	}
 	a.mu.Unlock()
+
+	if updated {
+		a.exportEpisodesText()
+	}
+
 	return cloneFeed(feed), nil
 }
 

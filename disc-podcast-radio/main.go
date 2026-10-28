@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	appVersion = "1.0.10"
+	appVersion = "1.2.2"
 	appName    = "DISC Podcast & Radio"
 	userAgent  = "Mozilla/5.0 (Linux; FiiO DISC) DISC-Podcast-Radio/" + appVersion
 )
@@ -178,6 +178,8 @@ type App struct {
 	lastProbe       string
 	lastStreamError string
 	activeStreams   int64
+	currentCoverBytes []byte
+	currentCoverMu    sync.RWMutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -259,6 +261,7 @@ var defaultPodcasts = []PodcastFeed{
 		ID:          "storyfm",
 		Title:       "故事FM",
 		URL:         "https://feeds.storyfm.cn/storyfm.xml",
+		Cover:       "https://media-one.wavpub.com/covers/1ebcbf5d-9dd2-4b69-b681-b54c22541cf2/977035cf6ab63b6e.png",
 		Description: "用你的声音，讲述你的故事。一个亲历者口述的声音纪录片节目。",
 		Author:      "爱哲",
 	},
@@ -266,6 +269,7 @@ var defaultPodcasts = []PodcastFeed{
 		ID:          "gcores",
 		Title:       "机核网 GCORES",
 		URL:         "https://alioss.gcores.com/feeds/apple_podcast_v1.xml",
+		Cover:       "https://alioss.gcores.com/download/podcast/gadio.png?v=1",
 		Description: "机核 GCORES 游戏与流行文化电台节目。",
 		Author:      "机核网",
 	},
@@ -273,6 +277,7 @@ var defaultPodcasts = []PodcastFeed{
 		ID:          "leftright",
 		Title:       "忽左忽右",
 		URL:         "https://feed.xyzfm.space/cv4bkgpuglwp",
+		Cover:       "https://image.xyzcdn.net/FrYMqb37Wg_LA8aenDJJ8SFGsjea",
 		Description: "忽左忽右，沙龙与知识播客，文化、政治、商业与历史。",
 		Author:      "JustPod",
 	},
@@ -280,6 +285,7 @@ var defaultPodcasts = []PodcastFeed{
 		ID:          "ritan",
 		Title:       "日谈公园",
 		URL:         "https://www.ximalaya.com/album/5574153.xml",
+		Cover:       "https://fdfs.xmcdn.com/group53/M08/04/7F/wKgLfFxFi1DyK_sOAAIVVH_yP2g776.jpg",
 		Description: "畅聊电影、音乐、生活与八卦的知名脱口秀播客。",
 		Author:      "李叔 & 小伙子",
 	},
@@ -355,6 +361,7 @@ func (a *App) Init() error {
 			a.podcasts[i].Episodes = []PodcastItem{}
 		}
 	}
+	a.exportEpisodesText()
 
 	// One-time replacement of dead 1.0.0 defaults. It only touches known old
 	// built-in URLs, so user-added stations and feeds survive the upgrade.
@@ -376,6 +383,10 @@ func (a *App) Init() error {
 
 	// 异步安全清理历史版本可能残留在 TF 卡上的 .disc-placeholders 和历史 .m3u
 	go a.cleanupLegacyPlaceholders()
+
+	// 初始化 TF 卡订阅及电台文件同步 (podcasts.txt / radios.txt)
+	a.initTFCardSync()
+	go a.tfCardWatcherLoop()
 
 	go a.discoveryLoop()
 	go a.statusPollLoop()
@@ -559,40 +570,48 @@ func (a *App) startupTasks() {
 	select {
 	case <-a.ctx.Done():
 		return
-	case <-time.After(4 * time.Second):
+	case <-time.After(3 * time.Second):
 	}
 
-	// Capture the device-side facts that make renderer discovery debuggable
-	// without SSH: listeners, process ownership, the control socket, and direct
-	// UPnP probes on localhost/LAN addresses. This runs in parallel with feed
-	// refresh so a slow SSDP scan does not delay the on-device playlists.
 	go a.logStartupDiagnostics()
 
-	// Populate empty default feeds in the background. This is what makes the
-	// on-device M3U folders useful even if the phone UI is never opened.
-	a.mu.RLock()
-	feeds := append([]PodcastFeed(nil), a.podcasts...)
-	a.mu.RUnlock()
-	for _, f := range feeds {
-		if len(f.Episodes) > 0 {
-			continue
+	for {
+		a.mu.RLock()
+		feeds := append([]PodcastFeed(nil), a.podcasts...)
+		a.mu.RUnlock()
+
+		allSuccess := true
+		for _, f := range feeds {
+			if len(f.Episodes) > 0 {
+				continue
+			}
+			allSuccess = false
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
+			ctx, cancel := context.WithTimeout(a.ctx, 45*time.Second)
+			feed, err := a.FetchPodcastEpisodes(ctx, f.URL, true)
+			cancel()
+			if err != nil {
+				a.log.Warnf("后台刷新内置播客《%s》失败: %v", f.Title, err)
+				continue
+			}
+			a.log.Infof("后台刷新内置播客《%s》完成，%d 集", feed.Title, len(feed.Episodes))
+			a.exportEpisodesText()
+		}
+		a.exportEpisodesText()
+		if allSuccess {
+			a.log.Infof("内置播客后台刷新完毕，已通过流媒体屏幕UI及Web就绪。")
+			return
 		}
 		select {
 		case <-a.ctx.Done():
 			return
-		case <-time.After(1 * time.Second):
+		case <-time.After(20 * time.Second):
 		}
-		ctx, cancel := context.WithTimeout(a.ctx, 45*time.Second)
-		feed, err := a.FetchPodcastEpisodes(ctx, f.URL, true)
-		cancel()
-		if err != nil {
-			a.log.Warnf("后台刷新内置播客《%s》失败: %v", f.Title, err)
-			continue
-		}
-		a.log.Infof("后台刷新内置播客《%s》完成，%d 集", feed.Title, len(feed.Episodes))
 	}
-	a.exportEpisodesText()
-	a.log.Infof("内置播客后台刷新完毕，已通过流媒体屏幕UI及Web就绪。")
 }
 
 func (a *App) commandListenerLoop() {
@@ -626,17 +645,75 @@ func (a *App) commandListenerLoop() {
 				playType := parts[0]
 				title := parts[1]
 				url := parts[2]
-				a.log.Infof("[ScreenUI] 收到屏幕纯文字点击播放指令: type=%s title=%s url=%s", playType, title, url)
+				artist := ""
+				if len(parts) >= 4 {
+					artist = parts[3]
+				}
+				if artist == "" {
+					if playType == "podcast" {
+						artist = "播客"
+					} else {
+						artist = "网络电台"
+					}
+				}
+				cover := a.findCoverForPlay(playType, title, artist, url)
+				a.log.Infof("[ScreenUI] 收到屏幕播放指令: type=%s title=%s artist=%s url=%s cover=%s", playType, title, artist, url, cover)
 				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 					defer cancel()
-					if err := a.PlayStream(ctx, url, title, "正在播放", "", playType); err != nil {
+					if err := a.PlayStream(ctx, url, title, artist, cover, playType); err != nil {
 						a.log.Errorf("[ScreenUI] 播放失败: %v", err)
 					}
 				}()
 			}
 		}
 	}
+}
+
+func (a *App) findCoverForPlay(playType, title, artist, streamURL string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if playType == "podcast" {
+		lowerArtist := strings.ToLower(strings.TrimSpace(artist))
+		for _, p := range a.podcasts {
+			if strings.EqualFold(p.Title, artist) || strings.EqualFold(p.ID, artist) {
+				if p.Cover != "" {
+					return p.Cover
+				}
+			}
+		}
+		if id, ok := podcastTitleAliases[lowerArtist]; ok {
+			for _, p := range a.podcasts {
+				if p.ID == id && p.Cover != "" {
+					return p.Cover
+				}
+			}
+		}
+		for _, p := range a.podcasts {
+			if strings.Contains(strings.ToLower(p.Title), lowerArtist) || strings.Contains(lowerArtist, strings.ToLower(p.Title)) {
+				if p.Cover != "" {
+					return p.Cover
+				}
+			}
+		}
+		for _, p := range defaultPodcasts {
+			if strings.Contains(strings.ToLower(p.Title), lowerArtist) || strings.Contains(lowerArtist, strings.ToLower(p.Title)) {
+				if p.Cover != "" {
+					return p.Cover
+				}
+			}
+		}
+	} else {
+		for _, s := range a.stations {
+			if strings.EqualFold(s.Name, title) || s.URL == streamURL {
+				if s.Favicon != "" {
+					return s.Favicon
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (a *App) exportEpisodesText() {
@@ -650,12 +727,22 @@ func (a *App) exportEpisodesText() {
 
 	var sb strings.Builder
 	for _, f := range podcasts {
-		sb.WriteString(fmt.Sprintf("[%s]\n", f.Title))
+		if strings.TrimSpace(f.Title) == "" {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("[%s]\n", strings.TrimSpace(f.Title)))
 		for i, ep := range f.Episodes {
-			if i >= 15 {
+			if i >= 50 {
 				break
 			}
-			sb.WriteString(fmt.Sprintf("%s | %s\n", ep.Title, ep.AudioURL))
+			cleanTitle := strings.ReplaceAll(ep.Title, "|", "-")
+			cleanTitle = strings.ReplaceAll(cleanTitle, "\t", " ")
+			cleanTitle = strings.ReplaceAll(cleanTitle, "\n", " ")
+			cleanTitle = strings.TrimSpace(cleanTitle)
+			cleanURL := strings.TrimSpace(ep.AudioURL)
+			if cleanTitle != "" && cleanURL != "" {
+				sb.WriteString(fmt.Sprintf("%s | %s\n", cleanTitle, cleanURL))
+			}
 		}
 	}
 
@@ -1038,14 +1125,39 @@ func main() {
 	_ = server.Shutdown(ctx)
 }
 
-// dialIPv4First avoids waiting for broken IPv6 routes, which is common on
-// embedded Wi-Fi stacks. It falls back to the system resolver if IPv4 fails.
+func init() {
+	// Embedded Linux on FiiO DISC has IPv6 completely disabled in the kernel.
+	// Force Go resolver to query over IPv4, and fallback to 223.5.5.5:53 / 119.29.29.29:53 directly
+	// when local dnsmasq ([::1]:53 or 127.0.0.1:53) is not yet forwarding upstream DNS.
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 4 * time.Second}
+			if strings.HasPrefix(address, "[::1]") || strings.Contains(address, "::") || strings.HasPrefix(address, "127.0.0.1") {
+				conn, err := d.DialContext(ctx, "udp4", "223.5.5.5:53")
+				if err == nil {
+					return conn, nil
+				}
+				conn, err = d.DialContext(ctx, "udp4", "119.29.29.29:53")
+				if err == nil {
+					return conn, nil
+				}
+				address = "127.0.0.1:53"
+			}
+			host, _, err := net.SplitHostPort(address)
+			if err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+					address = "223.5.5.5:53"
+				}
+			}
+			return d.DialContext(ctx, "udp4", address)
+		},
+	}
+}
+
+// dialIPv4First strictly forces IPv4 connections on the embedded system.
 var v4Dialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 
 func dialIPv4First(ctx context.Context, network, addr string) (net.Conn, error) {
-	c, err := v4Dialer.DialContext(ctx, "tcp4", addr)
-	if err == nil {
-		return c, nil
-	}
-	return v4Dialer.DialContext(ctx, "tcp", addr)
+	return v4Dialer.DialContext(ctx, "tcp4", addr)
 }

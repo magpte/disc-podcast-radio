@@ -681,28 +681,36 @@ func (a *App) probeRendererCandidates(ctx context.Context, candidates []renderer
 }
 
 func (a *App) rendererCandidates(includeSSDP bool) ([]rendererCandidate, []SSDPDiagnostic) {
-	candidates := []rendererCandidate{
-		{URL: "http://127.0.0.1:1286/description.xml", Source: "local-1286", Timeout: 2200 * time.Millisecond, Priority: 0},
-		{URL: "http://127.0.0.1:1286/", Source: "local-1286-root", Timeout: 2200 * time.Millisecond, Priority: 1},
-	}
-	for _, ip := range a.localIPv4List() {
-		if ip == "127.0.0.1" {
-			continue
-		}
-		candidates = append(candidates,
-			rendererCandidate{URL: "http://" + ip + ":1286/description.xml", Source: "local-ip-1286", Timeout: 1500 * time.Millisecond, Priority: 2},
-			rendererCandidate{URL: "http://" + ip + ":1286/", Source: "local-ip-1286-root", Timeout: 1500 * time.Millisecond, Priority: 3},
-		)
-	}
+	candidates := []rendererCandidate{}
+	localIPs := a.localIPv4List()
+
 	for _, port := range listeningPorts() {
-		if port == a.port || port < 1024 || port == 1286 || port == 22 || port == 139 || port == 445 || port == 1900 {
+		if port == a.port || port < 1024 || port == 22 || port == 139 || port == 445 || port == 1900 {
 			continue
 		}
-		candidates = append(candidates,
-			rendererCandidate{URL: fmt.Sprintf("http://127.0.0.1:%d/description.xml", port), Source: "local-port", Timeout: 1000 * time.Millisecond, Priority: 10},
-			rendererCandidate{URL: fmt.Sprintf("http://127.0.0.1:%d/", port), Source: "local-port-root", Timeout: 1000 * time.Millisecond, Priority: 11},
-		)
+		// Priority 0: mq_player stock UPnP dynamic ports (typically 49152..49500)
+		if port >= 49000 && port <= 50000 {
+			for _, ip := range localIPs {
+				candidates = append(candidates,
+					rendererCandidate{URL: fmt.Sprintf("http://%s:%d/description.xml", ip, port), Source: "local-upnp-port", Timeout: 300 * time.Millisecond, Priority: 0},
+					rendererCandidate{URL: fmt.Sprintf("http://%s:%d/", ip, port), Source: "local-upnp-port-root", Timeout: 300 * time.Millisecond, Priority: 1},
+				)
+			}
+		} else {
+			for _, ip := range localIPs {
+				candidates = append(candidates,
+					rendererCandidate{URL: fmt.Sprintf("http://%s:%d/description.xml", ip, port), Source: "local-port", Timeout: 400 * time.Millisecond, Priority: 10},
+					rendererCandidate{URL: fmt.Sprintf("http://%s:%d/", ip, port), Source: "local-port-root", Timeout: 400 * time.Millisecond, Priority: 11},
+				)
+			}
+		}
 	}
+
+	// Legacy 1286 fallback with low priority
+	candidates = append(candidates,
+		rendererCandidate{URL: "http://127.0.0.1:1286/description.xml", Source: "local-1286", Timeout: 150 * time.Millisecond, Priority: 50},
+		rendererCandidate{URL: "http://127.0.0.1:1286/", Source: "local-1286-root", Timeout: 150 * time.Millisecond, Priority: 51},
+	)
 	var ssdp []SSDPDiagnostic
 	if includeSSDP {
 		ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)

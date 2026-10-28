@@ -20,17 +20,21 @@ type LogEntry struct {
 // The in-memory ring is exposed through /api/logs so failures can be diagnosed
 // without SSH access.
 type Logger struct {
-	mu       sync.Mutex
-	ring     []LogEntry
-	max      int
-	file     *os.File
-	path     string
-	fileSize int64
+	mu        sync.Mutex
+	ring      []LogEntry
+	max       int
+	file      *os.File
+	path      string
+	fileSize  int64
+	tfFile    *os.File
+	tfSize    int64
+	tfChecked time.Time
 }
 
 const (
 	logMaxEntries = 2000
 	logMaxBytes   = 2 * 1024 * 1024
+	tfLogPath     = "/tmp/sdcard/disc-podcast-radio.log"
 )
 
 func NewLogger(dataDir string) *Logger {
@@ -43,7 +47,43 @@ func NewLogger(dataDir string) *Logger {
 			}
 		}
 	}
+	l.checkTFLogLocked()
 	return l
+}
+
+func (l *Logger) checkTFLogLocked() {
+	l.tfChecked = time.Now()
+	if l.tfFile != nil {
+		return
+	}
+	st, err := os.Stat("/tmp/sdcard")
+	if err != nil || !st.IsDir() {
+		return
+	}
+	f, err := os.OpenFile(tfLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		l.tfFile = f
+		if s, err := f.Stat(); err == nil {
+			l.tfSize = s.Size()
+		}
+	}
+}
+
+func (l *Logger) rotateTFLocked() {
+	if l.tfFile == nil {
+		return
+	}
+	_ = l.tfFile.Close()
+	backup := tfLogPath + ".1"
+	_ = os.Remove(backup)
+	_ = os.Rename(tfLogPath, backup)
+	f, err := os.OpenFile(tfLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		l.tfFile = nil
+		return
+	}
+	l.tfFile = f
+	l.tfSize = 0
 }
 
 func (l *Logger) write(level, msg string) {
@@ -64,15 +104,31 @@ func (l *Logger) write(level, msg string) {
 	}
 
 	_, _ = os.Stderr.WriteString(line)
-	if l.file == nil {
-		return
+	if l.file != nil {
+		n, err := l.file.WriteString(line)
+		if err == nil {
+			l.fileSize += int64(n)
+		}
+		if l.fileSize > logMaxBytes {
+			l.rotateLocked()
+		}
 	}
-	n, err := l.file.WriteString(line)
-	if err == nil {
-		l.fileSize += int64(n)
+
+	// Also write to TF card (/tmp/sdcard/disc-podcast-radio.log)
+	if time.Since(l.tfChecked) > 3*time.Second {
+		l.checkTFLogLocked()
 	}
-	if l.fileSize > logMaxBytes {
-		l.rotateLocked()
+	if l.tfFile != nil {
+		n, err := l.tfFile.WriteString(line)
+		if err != nil {
+			_ = l.tfFile.Close()
+			l.tfFile = nil
+		} else {
+			l.tfSize += int64(n)
+			if l.tfSize > logMaxBytes {
+				l.rotateTFLocked()
+			}
+		}
 	}
 }
 
@@ -142,6 +198,10 @@ func (l *Logger) Close() {
 	if l.file != nil {
 		_ = l.file.Close()
 		l.file = nil
+	}
+	if l.tfFile != nil {
+		_ = l.tfFile.Close()
+		l.tfFile = nil
 	}
 	l.mu.Unlock()
 }

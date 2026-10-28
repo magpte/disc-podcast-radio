@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -373,6 +374,9 @@ func didlMetadata(title, artist, album, cover, mediaURL, contentType string) str
 	if artist != "" {
 		b.WriteString("<upnp:artist>" + xmlEscape(artist) + "</upnp:artist>")
 	}
+	if album != "" {
+		b.WriteString("<upnp:album>" + xmlEscape(album) + "</upnp:album>")
+	}
 	b.WriteString("<upnp:class>object.item.audioItem.musicTrack</upnp:class>")
 	if cover != "" && (strings.HasPrefix(cover, "http://") || strings.HasPrefix(cover, "https://")) {
 		b.WriteString("<upnp:albumArtURI>" + xmlEscape(cover) + "</upnp:albumArtURI>")
@@ -619,6 +623,37 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		album = "DISC 播客"
 	}
 
+	// Transparently resolve RSS feed URLs to the latest playable audio stream
+	if strings.HasSuffix(strings.ToLower(streamURL), ".xml") || strings.Contains(streamURL, "feed") || mediaType == "podcast" {
+		isFeedURL := strings.HasSuffix(strings.ToLower(streamURL), ".xml")
+		if !isFeedURL {
+			a.mu.RLock()
+			for _, pf := range a.podcasts {
+				if pf.URL == streamURL {
+					isFeedURL = true
+					break
+				}
+			}
+			a.mu.RUnlock()
+		}
+		if isFeedURL {
+			a.log.Infof("检测到播客 RSS 订阅链接: %s，正在自动获取最新单集音频…", streamURL)
+			feed, ferr := a.FetchPodcastEpisodes(ctx, streamURL, false)
+			if ferr == nil && feed != nil && len(feed.Episodes) > 0 {
+				a.log.Infof("成功获取单集: %s (%s)", feed.Episodes[0].Title, feed.Episodes[0].AudioURL)
+				streamURL = feed.Episodes[0].AudioURL
+				if subtitle == "" || subtitle == "未知单集" || subtitle == "播客" {
+					subtitle = feed.Episodes[0].Title
+				}
+				if feed.Cover != "" {
+					cover = feed.Cover
+				}
+			} else {
+				a.log.Warnf("从 RSS %s 获取单集失败: %v", streamURL, ferr)
+			}
+		}
+	}
+
 	a.mu.Lock()
 	a.status.Playing = false
 	a.status.Type = mediaType
@@ -633,29 +668,71 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
 
-	// Fast probe (3 seconds timeout), fallback to URL ext MIME if timed out or failed
-	probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
-	probe, err := a.probeStream(probeCtx, streamURL)
-	probeCancel()
 	ext := "mp3"
 	ct := "audio/mpeg"
 	format := ""
 	resolvedURL := streamURL
-	if err == nil && probe != nil {
-		if probe.Ext != "" {
-			ext = probe.Ext
-		}
-		if probe.ContentType != "" {
-			ct = probe.ContentType
-		}
-		format = probe.Format
-		if probe.FinalURL != "" {
-			resolvedURL = probe.FinalURL
-		}
+
+	directExt := extFromURL(streamURL)
+	isKnownDirect := (directExt == "mp3" || directExt == "m4a" || directExt == "aac" || directExt == "flac" || directExt == "wav" || directExt == "ogg") && !looksLikeHLSURL(streamURL)
+
+	if isKnownDirect {
+		ext = directExt
+		ct = mimeForExt(ext)
+		a.log.Infof("直链音频跳过探测直接推流: %s (ext=%s ct=%s)", streamURL, ext, ct)
 	} else {
-		if uExt := extFromURL(streamURL); uExt != "" {
-			ext = uExt
-			ct = mimeForExt(ext)
+		// Fast probe (3 seconds timeout), fallback to URL ext MIME if timed out or failed
+		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
+		probe, err := a.probeStream(probeCtx, streamURL)
+		probeCancel()
+		if err == nil && probe != nil {
+			if probe.Ext != "" {
+				ext = probe.Ext
+			}
+			if probe.ContentType != "" {
+				ct = probe.ContentType
+			}
+			format = probe.Format
+			if probe.FinalURL != "" {
+				resolvedURL = probe.FinalURL
+			}
+		} else {
+			if uExt := extFromURL(streamURL); uExt != "" {
+				ext = uExt
+				ct = mimeForExt(ext)
+			}
+		}
+	}
+
+	// Secondary check: if probe returned xml/html content-type for a podcast URL
+	if strings.Contains(ct, "xml") || strings.Contains(ct, "text/html") {
+		a.log.Warnf("探测到非音频 Content-Type: %s (%s)，尝试作为播客 RSS 解析…", ct, streamURL)
+		feed, ferr := a.FetchPodcastEpisodes(ctx, streamURL, false)
+		if ferr == nil && feed != nil && len(feed.Episodes) > 0 {
+			a.log.Infof("成功从 RSS 解析到最新音频: %s -> %s", feed.Episodes[0].Title, feed.Episodes[0].AudioURL)
+			streamURL = feed.Episodes[0].AudioURL
+			subtitle = feed.Episodes[0].Title
+			if feed.Cover != "" {
+				cover = feed.Cover
+			}
+			probeCtx2, probeCancel2 := context.WithTimeout(ctx, 3*time.Second)
+			probe2, err2 := a.probeStream(probeCtx2, streamURL)
+			probeCancel2()
+			if err2 == nil && probe2 != nil {
+				if probe2.Ext != "" {
+					ext = probe2.Ext
+				}
+				if probe2.ContentType != "" {
+					ct = probe2.ContentType
+				}
+				format = probe2.Format
+				if probe2.FinalURL != "" {
+					resolvedURL = probe2.FinalURL
+				}
+			} else {
+				ext = "mp3"
+				ct = "audio/mpeg"
+			}
 		}
 	}
 
@@ -691,7 +768,22 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	_ = a.stopRenderer(stopCtx, r)
 	stopCancel()
 
-	meta := didlMetadata(title, subtitle, album, cover, proxyURL, ct)
+	// Prepare cover image and cache bytes
+	coverBytes := a.prepareCoverImage(ctx, cover, mediaType, title, subtitle)
+	a.currentCoverMu.Lock()
+	a.currentCoverBytes = coverBytes
+	a.currentCoverMu.Unlock()
+
+	// Write directly to /usr/data/fiio/net_cover.jpg so it is immediately available
+	_ = os.MkdirAll("/usr/data/fiio", 0755)
+	_ = os.WriteFile("/usr/data/fiio/net_cover.jpg", coverBytes, 0644)
+
+	localCoverURL := fmt.Sprintf("http://127.0.0.1:%d/cover.jpg", a.port)
+	a.mu.Lock()
+	a.status.Cover = localCoverURL
+	a.mu.Unlock()
+
+	meta := didlMetadata(title, subtitle, album, localCoverURL, proxyURL, ct)
 	setCtx, setCancel := context.WithTimeout(ctx, 6*time.Second)
 	err = a.setAVTransportURI(setCtx, r, proxyURL, meta)
 	setCancel()
@@ -700,6 +792,22 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		retryCtx, retryCancel := context.WithTimeout(ctx, 6*time.Second)
 		err = a.setAVTransportURI(retryCtx, r, proxyURL, "")
 		retryCancel()
+	}
+	if err != nil {
+		a.log.Warnf("设置播放地址遇到连接失败 (%v)，播放器可能刚重启或更换端口，立即重新发现…", err)
+		a.setRenderer(nil)
+		if freshR, ferr := a.ensureRenderer(6 * time.Second); ferr == nil && freshR != nil {
+			r = freshR
+			a.log.Infof("已重新发现活跃播放器: %s，立即重新下发播放地址", r.ControlURL)
+			retryCtx, retryCancel := context.WithTimeout(ctx, 6*time.Second)
+			err = a.setAVTransportURI(retryCtx, r, proxyURL, meta)
+			retryCancel()
+			if err != nil {
+				retryCtx2, retryCancel2 := context.WithTimeout(ctx, 6*time.Second)
+				err = a.setAVTransportURI(retryCtx2, r, proxyURL, "")
+				retryCancel2()
+			}
+		}
 	}
 	if err != nil {
 		msg := "设置播放地址失败: " + err.Error()
@@ -718,6 +826,17 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		retryPlayCancel()
 	}
 	if err != nil {
+		a.log.Warnf("启动播放重试失败 (%v)，尝试重新发现播放器并恢复播放…", err)
+		a.setRenderer(nil)
+		if freshR, ferr := a.ensureRenderer(6 * time.Second); ferr == nil && freshR != nil {
+			r = freshR
+			_ = a.setAVTransportURI(ctx, r, proxyURL, meta)
+			playRetryCtx2, playRetryCancel2 := context.WithTimeout(ctx, 6*time.Second)
+			err = a.rendererPlay(playRetryCtx2, r)
+			playRetryCancel2()
+		}
+	}
+	if err != nil {
 		msg := "启动播放失败: " + err.Error()
 		a.setStatusError(msg)
 		a.setLastStreamError(msg)
@@ -732,15 +851,12 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
 
-	// Mark online streaming active so LCD sleep and power management stay alive
-	_ = os.MkdirAll("/tmp/disc-online-music", 0755)
-	_ = os.WriteFile("/tmp/disc-online-music/active", []byte("1\n"), 0644)
-	_ = os.WriteFile("/tmp/disc-online-music/session", []byte("1\n"), 0644)
-	nowPlayingContent := fmt.Sprintf("1\tPLAYING\torder\t0\t0\tauto\t%s\t44100\t16\t0\n%s\n%s\n%s\n\n\n",
-		strings.ToUpper(ext), title, subtitle, album)
-	_ = os.WriteFile("/tmp/disc-online-music/nowplaying", []byte(nowPlayingContent), 0644)
+	// Remove any online-music session files so native DLNA UI and stream audio info are fully visible
+	_ = os.Remove("/tmp/disc-online-music/session")
+	_ = os.Remove("/tmp/disc-online-music/active")
+	_ = os.Remove("/tmp/disc-online-music/nowplaying")
 
-	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s", title, subtitle, r.ControlURL, proxyURL)
+	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s cover=%s", title, subtitle, r.ControlURL, proxyURL, localCoverURL)
 	return nil
 }
 
@@ -857,6 +973,7 @@ func (a *App) streamEntry(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return a.serveHLS(ctx, w, r, entry, target)
 	}
 
+
 	resp, err := a.openUpstream(ctx, target, r.Header.Get("Range"))
 	if err != nil {
 		return err
@@ -927,7 +1044,8 @@ func (a *App) streamEntry(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if r.Method == http.MethodHead {
 		return nil
 	}
-	return copyAndFlush(ctx, w, br, true)
+	live := entry.Kind == "radio"
+	return copyAndFlush(ctx, w, br, live)
 }
 
 func (a *App) serveTSResponse(ctx context.Context, w http.ResponseWriter, br *bufio.Reader, resp *http.Response, r *http.Request) error {
@@ -992,9 +1110,26 @@ func (a *App) serveTSResponse(ctx context.Context, w http.ResponseWriter, br *bu
 	}
 }
 
+const (
+	defaultBurstBytes   = 2 * 1024 * 1024 // 2 MB 初始突发：保证播放器秒开缓冲并解析元数据 (彻底消除 FFmpeg 探测被限速卡死)
+	defaultPaceBytesSec = 96 * 1024       // 96 KB/s (~768 kbps) 平滑控速：保证高码率不卡顿并防止环形缓冲溢出
+)
+
 func copyAndFlush(ctx context.Context, w http.ResponseWriter, src io.Reader, live bool) error {
-	buf := make([]byte, 32<<10)
+	buf := make([]byte, 16<<10)
 	lastFlush := time.Now()
+	var totalSent int64
+	var burstOverTime time.Time
+
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1006,11 +1141,46 @@ func copyAndFlush(ctx context.Context, w http.ResponseWriter, src io.Reader, liv
 			if _, ew := w.Write(buf[:n]); ew != nil {
 				return ew
 			}
-			if live && time.Since(lastFlush) > 120*time.Millisecond {
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
+			totalSent += int64(n)
+
+			if live {
+				if time.Since(lastFlush) > 100*time.Millisecond {
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					lastFlush = time.Now()
 				}
-				lastFlush = time.Now()
+			} else {
+				flushInterval := 250 * time.Millisecond
+				if totalSent <= defaultBurstBytes {
+					flushInterval = 50 * time.Millisecond // 初始突发阶段更频繁flush，降低首帧等待时延
+				}
+				if time.Since(lastFlush) > flushInterval {
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					lastFlush = time.Now()
+				}
+				if totalSent > defaultBurstBytes {
+					if burstOverTime.IsZero() {
+						burstOverTime = time.Now()
+					}
+					pacedBytes := totalSent - defaultBurstBytes
+					expectedElapsed := time.Duration(pacedBytes) * time.Second / defaultPaceBytesSec
+					actualElapsed := time.Since(burstOverTime)
+					if expectedElapsed > actualElapsed {
+						sleepDur := expectedElapsed - actualElapsed
+						if sleepDur > 250*time.Millisecond {
+							sleepDur = 250 * time.Millisecond
+						}
+						timer.Reset(sleepDur)
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-timer.C:
+						}
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -1021,6 +1191,19 @@ func copyAndFlush(ctx context.Context, w http.ResponseWriter, src io.Reader, liv
 		}
 	}
 }
+
+func ffmpegBinary() string {
+	for _, p := range []string{"/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"} {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("ffmpeg"); err == nil {
+		return p
+	}
+	return ""
+}
+
 
 // --- Playlist / HLS parsing ---
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -55,6 +56,7 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "接口不存在: " + r.URL.Path})
 	})
 	mux.HandleFunc("/audio/", a.handleAudio)
+	mux.HandleFunc("/cover.jpg", a.handleCover)
 	mux.HandleFunc("/", a.handleStatic)
 }
 
@@ -827,3 +829,25 @@ func (a *App) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
 }
+
+func (a *App) handleCover(w http.ResponseWriter, r *http.Request) {
+	a.currentCoverMu.RLock()
+	data := a.currentCoverBytes
+	a.currentCoverMu.RUnlock()
+
+	if len(data) == 0 {
+		a.mu.RLock()
+		mediaType := a.status.Type
+		title := a.status.Title
+		subTitle := a.status.SubTitle
+		a.mu.RUnlock()
+		data = defaultCoverJPEG(mediaType, title, subTitle)
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+

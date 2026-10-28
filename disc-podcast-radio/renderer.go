@@ -94,7 +94,10 @@ func (a *App) rendererSnapshot() (*RendererInfo, string, time.Time) {
 }
 
 func (a *App) setRenderer(r *RendererInfo) {
+	a.rendererMu.Lock()
 	if r == nil {
+		a.renderer = nil
+		a.rendererMu.Unlock()
 		return
 	}
 	now := time.Now()
@@ -106,7 +109,6 @@ func (a *App) setRenderer(r *RendererInfo) {
 	r.RenderingEventURL = localizeURL(r.RenderingEventURL)
 	r.ConnectionMgrURL = localizeURL(r.ConnectionMgrURL)
 
-	a.rendererMu.Lock()
 	old := a.renderer
 	a.renderer = r
 	a.rendererErr = ""
@@ -188,15 +190,17 @@ func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		if r := a.currentRenderer(); r != nil {
-			if time.Since(r.LastSeen) < rendererStaleAfter {
-				return r, nil
-			}
-			ctx, cancel := context.WithTimeout(a.ctx, 1500*time.Millisecond)
-			_, err := a.getTransportInfo(ctx, r)
-			cancel()
-			if err == nil {
-				a.touchRenderer(r)
-				return r, nil
+			// Fast active probe to check if the cached renderer's TCP port is still listening
+			hp := hostPortFromURL(r.ControlURL)
+			if hp != "" {
+				conn, err := net.DialTimeout("tcp4", hp, 250*time.Millisecond)
+				if err == nil {
+					conn.Close()
+					a.touchRenderer(r)
+					return r, nil
+				}
+				a.log.Warnf("缓存的播放器端口不可达 (%s: %v)，立即重新探测…", hp, err)
+				a.setRenderer(nil)
 			}
 		}
 
@@ -218,7 +222,7 @@ func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
 		select {
 		case <-a.ctx.Done():
 			return nil, a.ctx.Err()
-		case <-time.After(150 * time.Millisecond):
+		case <-time.After(80 * time.Millisecond):
 		}
 	}
 }
@@ -263,7 +267,7 @@ func (a *App) discoverControlOnce(ctx context.Context) (string, error) {
 	}
 	defer conn.Close()
 
-	deadline := time.Now().Add(1200 * time.Millisecond)
+	deadline := time.Now().Add(400 * time.Millisecond)
 	if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
 		deadline = until
 	}
@@ -714,6 +718,14 @@ func portFromURL(raw string) int {
 	}
 	p, _ := strconv.Atoi(u.Port())
 	return p
+}
+
+func hostPortFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 // --- SOAP / AVTransport ---
