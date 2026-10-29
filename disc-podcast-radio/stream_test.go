@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -54,3 +55,19 @@ func TestCopyAndFlushLiveNoPacing(t *testing.T) {
 		t.Errorf("live stream took too long: %v (expected < 100ms)", elapsed)
 	}
 }
+
+func TestAppActiveStreamsAtomic(t *testing.T) {
+	app := &App{}
+	if atomic.LoadInt32(&app.activeStreams) != 0 {
+		t.Fatalf("expected 0, got %d", app.activeStreams)
+	}
+	atomic.AddInt32(&app.activeStreams, 1)
+	if atomic.LoadInt32(&app.activeStreams) != 1 {
+		t.Fatalf("expected 1, got %d", app.activeStreams)
+	}
+	atomic.AddInt32(&app.activeStreams, -1)
+	if atomic.LoadInt32(&app.activeStreams) != 0 {
+		t.Fatalf("expected 0, got %d", app.activeStreams)
+	}
+}
+

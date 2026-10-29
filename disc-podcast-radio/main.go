@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	appVersion = "1.2.2"
+	appVersion = "1.2.5"
 	appName    = "DISC Podcast & Radio"
 	userAgent  = "Mozilla/5.0 (Linux; FiiO DISC) DISC-Podcast-Radio/" + appVersion
 )
@@ -165,6 +165,8 @@ type App struct {
 	playerPIDsAt         time.Time
 
 	playMu          sync.Mutex
+	playCancel      context.CancelFunc
+	playCancelMu    sync.Mutex
 	playlistMu      sync.Mutex
 	playlistRoot    string
 	playlistFiles   []string
@@ -177,7 +179,7 @@ type App struct {
 
 	lastProbe       string
 	lastStreamError string
-	activeStreams   int64
+	activeStreams   int32
 	currentCoverBytes []byte
 	currentCoverMu    sync.RWMutex
 
@@ -188,7 +190,7 @@ type App struct {
 
 // Default radio presets. These are deliberately direct MP3 streams where
 // possible: they start instantly and avoid HLS edge cases on the player.
-const defaultsVersion = 2
+const defaultsVersion = 3
 
 // 1.0.0 shipped several feeds/streams that later disappeared. These URL maps
 // let an upgrade replace only the old built-ins while keeping user-added
@@ -199,26 +201,29 @@ var legacyStationDefaults = map[string]string{
 	"http://ngcdn003.cnr.cn/live/yyzs/index.m3u8":             "cnr3",
 	"http://stream.live.vc.bbcmedia.co.uk/bbc_world_service":  "bbcworld",
 	"https://stream.live.vc.bbcmedia.co.uk/bbc_world_service": "bbcworld",
-	"http://stream.zeno.fm/f3wvbbqmdg8uv":                     "lofi",
-	"https://stream.zeno.fm/f3wvbbqmdg8uv":                    "lofi",
+	"http://stream.zeno.fm/f3wvbbqmdg8uv":                     "oldies",
+	"https://stream.zeno.fm/f3wvbbqmdg8uv":                    "oldies",
 }
 
 var legacyPodcastURLs = map[string]bool{
 	"https://feeds.fireside.fm/storyfm/rss": true,
+	"https://feeds.storyfm.cn/storyfm.xml":  true,
 	"https://feed.xyzfm.space/42y25528z392": true,
 	"https://feed.xyzfm.space/8y7m5n04y8w9": true,
 	"https://feed.xyzfm.space/6q9x5z4y1m89": true,
 }
 
 var legacyPodcastURLDefaults = map[string]string{
-	"https://feeds.fireside.fm/storyfm/rss": "storyfm",
+	"https://feeds.fireside.fm/storyfm/rss": "buhsy",
+	"https://feeds.storyfm.cn/storyfm.xml":  "buhsy",
 	"https://feed.xyzfm.space/42y25528z392": "leftright",
 	"https://feed.xyzfm.space/8y7m5n04y8w9": "gcores",
 	"https://feed.xyzfm.space/6q9x5z4y1m89": "ritan",
 }
 
 var podcastTitleAliases = map[string]string{
-	"故事fm":       "storyfm",
+	"故事fm":       "buhsy",
+	"不合时宜":       "buhsy",
 	"机核游戏频道":     "gcores",
 	"机核网 gcores": "gcores",
 	"忽左忽右":       "leftright",
@@ -246,7 +251,7 @@ var defaultStations = []RadioStation{
 	{ID: "shnews", Name: "上海新闻广播", URL: "http://lhttp.qingting.fm/live/270/64k.mp3", Category: "新闻资讯", Bitrate: 64, Codec: "MP3"},
 	{ID: "finance1", Name: "第一财经广播", URL: "http://lhttp.qingting.fm/live/276/64k.mp3", Category: "财经", Bitrate: 64, Codec: "MP3"},
 	{ID: "morning", Name: "清晨音乐台", URL: "http://lhttp.qingting.fm/live/4915/64k.mp3", Category: "轻音乐/爵士", Bitrate: 64, Codec: "MP3"},
-	{ID: "lofi", Name: "Lofi Chill Beats", URL: "https://stream.zeno.fm/f3wvbbqmdg8uv", Category: "轻音乐/爵士", Codec: "MP3"},
+	{ID: "oldies", Name: "怀旧金曲", URL: "http://lhttp.qingting.fm/live/4917/64k.mp3", Category: "轻音乐/爵士", Bitrate: 64, Codec: "MP3"},
 	{ID: "radioparadise", Name: "Radio Paradise", URL: "https://stream.radioparadise.com/mp3-128", Category: "轻音乐/爵士", Bitrate: 128, Codec: "MP3"},
 	{ID: "somafm", Name: "SomaFM Groove Salad", URL: "https://ice1.somafm.com/groovesalad-128-mp3", Category: "轻音乐/爵士", Bitrate: 128, Codec: "MP3"},
 	{ID: "radio4", Name: "NPO Radio 4 古典", URL: "https://icecast.omroep.nl/radio4-bb-mp3", Category: "古典世界", Codec: "MP3"},
@@ -258,12 +263,12 @@ var defaultStations = []RadioStation{
 // all returned HTTP 404, which is why the episode screen crashed.
 var defaultPodcasts = []PodcastFeed{
 	{
-		ID:          "storyfm",
-		Title:       "故事FM",
-		URL:         "https://feeds.storyfm.cn/storyfm.xml",
-		Cover:       "https://media-one.wavpub.com/covers/1ebcbf5d-9dd2-4b69-b681-b54c22541cf2/977035cf6ab63b6e.png",
-		Description: "用你的声音，讲述你的故事。一个亲历者口述的声音纪录片节目。",
-		Author:      "爱哲",
+		ID:          "buhsy",
+		Title:       "不合时宜",
+		URL:         "https://feed.xyzfm.space/ww7cqnybekty",
+		Cover:       "https://image.xyzcdn.net/Fq-ccfNzhgTqQNzlG-1qA_jOow7l.png",
+		Description: "以跨文化视野与敏锐触角，探讨当下青年关注的生活叙事与公共议题。",
+		Author:      "若含 & 孟常 & 王磬",
 	},
 	{
 		ID:          "gcores",
@@ -456,6 +461,9 @@ func (a *App) mergeDefaultStations() bool {
 				def, ok = byID[id]
 			}
 		}
+		if !ok && cur.ID == "lofi" {
+			def, ok = byID["oldies"]
+		}
 		if !ok {
 			out = append(out, cur)
 			used[cur.ID] = true
@@ -512,6 +520,9 @@ func (a *App) mergeDefaultPodcasts() bool {
 			if id, legacy := legacyPodcastURLDefaults[key]; legacy {
 				def, ok = byID[id]
 			}
+		}
+		if !ok && cur.ID == "storyfm" {
+			def, ok = byID["buhsy"]
 		}
 		if ok {
 			// Keep current feed data, but only replace a known old built-in or
@@ -658,13 +669,28 @@ func (a *App) commandListenerLoop() {
 				}
 				cover := a.findCoverForPlay(playType, title, artist, url)
 				a.log.Infof("[ScreenUI] 收到屏幕播放指令: type=%s title=%s artist=%s url=%s cover=%s", playType, title, artist, url, cover)
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-					defer cancel()
-					if err := a.PlayStream(ctx, url, title, artist, cover, playType); err != nil {
-						a.log.Errorf("[ScreenUI] 播放失败: %v", err)
+				a.playCancelMu.Lock()
+				if a.playCancel != nil {
+					a.playCancel()
+				}
+				playCtx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+				a.playCancel = cancel
+				a.playCancelMu.Unlock()
+
+				go func(ctx context.Context, pType, pTitle, pArtist, pURL, pCover string) {
+					a.playMu.Lock()
+					defer a.playMu.Unlock()
+					if ctx.Err() != nil {
+						return
 					}
-				}()
+					if err := a.PlayStream(ctx, pURL, pTitle, pArtist, pCover, pType); err != nil {
+						if ctx.Err() == nil {
+							a.log.Errorf("[ScreenUI] 播放失败: %v", err)
+						} else {
+							a.log.Infof("[ScreenUI] 播放已由后续新指令取消: %s", pTitle)
+						}
+					}
+				}(playCtx, playType, title, artist, url, cover)
 			}
 		}
 	}
@@ -1156,7 +1182,7 @@ func init() {
 }
 
 // dialIPv4First strictly forces IPv4 connections on the embedded system.
-var v4Dialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+var v4Dialer = &net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}
 
 func dialIPv4First(ctx context.Context, network, addr string) (net.Conn, error) {
 	return v4Dialer.DialContext(ctx, "tcp4", addr)

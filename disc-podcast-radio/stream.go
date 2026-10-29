@@ -929,8 +929,8 @@ func (a *App) handleAudio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.log.Infof("音频代理开始: %s type=%s ext=%s ua=%q range=%q", entry.Title, entry.ContentType, entry.Ext, r.UserAgent(), r.Header.Get("Range"))
-	atomic.AddInt64(&a.activeStreams, 1)
-	defer atomic.AddInt64(&a.activeStreams, -1)
+	atomic.AddInt32(&a.activeStreams, 1)
+	defer atomic.AddInt32(&a.activeStreams, -1)
 	start := time.Now()
 	cw := &countingWriter{ResponseWriter: w}
 	if err := a.streamEntry(r.Context(), cw, r, entry, 0); err != nil {

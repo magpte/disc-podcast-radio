@@ -68,10 +68,12 @@ for cand in /tmp/sdcard/DISC_MODULES/disc-podcast-radio/*/disc-podcast-radio /tm
 done
 
 if [ -n "$tf_bin" ]; then
+  tf_hash=$(sha256sum "$tf_bin" 2>/dev/null | awk '{print $1}' || echo "tf")
+  cur_hash=$(sha256sum "$target_bin" 2>/dev/null | awk '{print $1}' || echo "cur")
   tf_size=$(wc -c < "$tf_bin" 2>/dev/null || echo 0)
   cur_size=$(wc -c < "$target_bin" 2>/dev/null || echo 0)
-  if [ "$tf_size" -gt 0 ] && [ "$tf_size" -ne "$cur_size" ]; then
-    echo "Found newer binary on TF card ($tf_size bytes vs local $cur_size bytes): $tf_bin" >>"$log_file" 2>&1 || true
+  if [ "$tf_size" -gt 0 ] && { [ "$tf_hash" != "$cur_hash" ] || [ "$tf_size" -ne "$cur_size" ]; }; then
+    echo "Found newer/updated binary on TF card ($tf_bin, hash=$tf_hash vs local=$cur_hash, size=$tf_size vs $cur_size)" >>"$log_file" 2>&1 || true
     # Attempt in-place update if local binary directory is writable
     if cp -f "$tf_bin" "./disc-podcast-radio.new" 2>/dev/null && chmod 755 "./disc-podcast-radio.new" 2>/dev/null; then
       mv -f "./disc-podcast-radio.new" "./disc-podcast-radio" 2>/dev/null || true
@@ -82,6 +84,7 @@ if [ -n "$tf_bin" ]; then
     fi
   fi
 fi
+
 
 {
   printf '\n=== %s disc-podcast-radio startup ===\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"

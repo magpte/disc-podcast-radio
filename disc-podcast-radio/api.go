@@ -132,9 +132,16 @@ func (a *App) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.playCancelMu.Lock()
+	if a.playCancel != nil {
+		a.playCancel()
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 55*time.Second)
+	a.playCancel = cancel
+	a.playCancelMu.Unlock()
+
 	a.playMu.Lock()
 	defer a.playMu.Unlock()
-	ctx, cancel := context.WithTimeout(a.ctx, 55*time.Second)
 	defer cancel()
 	if err := a.PlayStream(ctx, streamURL, body.Title, body.Subtitle, body.Cover, body.Type); err != nil {
 		a.log.Warnf("播放请求失败: %s (%v)", streamURL, err)
@@ -560,7 +567,7 @@ func (a *App) handleDebug(w http.ResponseWriter, r *http.Request) {
 		"feed_cache":          feedCache,
 		"media_tokens":        mediaCount,
 		"downloads":           downloadCount,
-		"active_streams":      atomic.LoadInt64(&a.activeStreams),
+		"active_streams":      atomic.LoadInt32(&a.activeStreams),
 		"last_probe":          lastProbe,
 		"last_stream_error":   lastStreamError,
 		"playlist_root":       a.playlistRoot,

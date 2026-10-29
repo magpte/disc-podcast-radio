@@ -10,7 +10,7 @@
  * 5. Full support for DISC_MODULES_SAFE_MODE bypass.
  */
 
-#define UI_HOOK_VERSION "1.2.2"
+#define UI_HOOK_VERSION "1.2.5"
 
 typedef unsigned int size_t;
 typedef int ssize_t;
@@ -251,8 +251,8 @@ static const station_data_t g_province_stations[] = {
 };
 
 static const station_data_t g_network_stations[] = {
-    {"Asia Hitz 亚洲流行", "http://listen.radionomy.com/asiahitz"},
-    {"Lofi Hip Hop 放松电台", "http://stream.zeno.fm/0r0xa792kwzuv"}
+    {"清晨音乐台", "http://lhttp.qingting.fm/live/4915/64k.mp3"},
+    {"怀旧金曲", "http://lhttp.qingting.fm/live/4917/64k.mp3"}
 };
 
 static const radio_cat_data_t g_radio_cats[] = {
@@ -287,14 +287,21 @@ static const episode_data_t g_gcores_eps[] = {
 };
 
 static const episode_data_t g_hzyh_eps[] = {
-    {"忽左忽右: 最新一期对谈", "https://feed.xyzfm.space/5k25126804"},
-    {"忽左忽右: 历史与文化", "https://feed.xyzfm.space/5k25126804"}
+    {"忽左忽右: 最新一期对谈", "https://feed.xyzfm.space/cv4bkgpuglwp"},
+    {"忽左忽右: 历史与文化", "https://feed.xyzfm.space/cv4bkgpuglwp"}
+};
+
+static const episode_data_t g_buhsy_eps[] = {
+    {"不合时宜: 能源转型与经济", "https://feed.xyzfm.space/ww7cqnybekty"},
+    {"不合时宜: 记者与冲突现场", "https://feed.xyzfm.space/ww7cqnybekty"},
+    {"不合时宜: 科技时代的生活", "https://feed.xyzfm.space/ww7cqnybekty"}
 };
 
 static const podcast_feed_data_t g_podcasts[] = {
     {"日谈公园", "ritan", g_ritan_eps, sizeof(g_ritan_eps)/sizeof(g_ritan_eps[0])},
     {"机核 GCORES", "gcores", g_gcores_eps, sizeof(g_gcores_eps)/sizeof(g_gcores_eps[0])},
-    {"忽左忽右", "hzyh", g_hzyh_eps, sizeof(g_hzyh_eps)/sizeof(g_hzyh_eps[0])}
+    {"忽左忽右", "hzyh", g_hzyh_eps, sizeof(g_hzyh_eps)/sizeof(g_hzyh_eps[0])},
+    {"不合时宜", "buhsy", g_buhsy_eps, sizeof(g_buhsy_eps)/sizeof(g_buhsy_eps[0])}
 };
 #define PODCAST_COUNT (sizeof(g_podcasts)/sizeof(g_podcasts[0]))
 
