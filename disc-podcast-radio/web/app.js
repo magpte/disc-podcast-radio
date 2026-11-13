@@ -32,8 +32,8 @@ document.addEventListener('DOMContentLoaded', () => {
   loadPodcasts();
   pollStatus();
 
-  setInterval(pollStatus, 3000);
-  setInterval(pollDownloads, 2500);
+  setInterval(pollStatus, 4000);
+  setInterval(pollDownloads, 5000);
 
   const stationsList = document.getElementById('stations-list');
   if (stationsList) {
@@ -620,17 +620,20 @@ async function sendPlay(url, title, subtitle, cover, type, id) {
       updateDockUI(data.status);
       updatePlayingClasses();
     }
-    showToast(data.status && data.status.playing ? `正在播放：${title}` : `已发送到播放器：${title}`, 'success');
-    setTimeout(pollStatus, 700);
-    setTimeout(pollStatus, 2200);
+    showToast(`已开始播放：${title}`, 'success');
+    setTimeout(pollStatus, 800);
+    setTimeout(pollStatus, 2500);
   } catch (err) {
     state.pendingPlay = false;
+    if (err.message && (err.message.includes('canceled') || err.message.includes('superseded'))) {
+      return;
+    }
     updateDockUI({
       title, subtitle, cover, playing: false, renderer_state: 'ERROR',
       error: err.message, stream_url: url, type,
     });
-    showToast('播放失败: ' + err.message, 'error', 9000);
-    setTimeout(pollStatus, 700);
+    showToast('播放失败: ' + err.message, 'error', 7000);
+    setTimeout(pollStatus, 1000);
   }
 }
 
@@ -712,6 +715,37 @@ function updateDockUI(st, pending = false) {
       statusText.textContent = '连接就绪';
       subEl.classList.remove('error-text');
     }
+  }
+
+  const progressWrap = document.getElementById('dock-progress-wrap');
+  const progressFill = document.getElementById('dock-progress-fill');
+  if (progressWrap && progressFill) {
+    if (st.type === 'podcast' && st.duration > 0 && (st.playing || st.renderer_state === 'PAUSED_PLAYBACK')) {
+      progressWrap.style.display = 'block';
+      const pct = Math.max(0, Math.min(100, (st.position / st.duration) * 100));
+      progressFill.style.width = pct + '%';
+      if (st.subtitle && st.duration_str) {
+        subEl.textContent = `${st.subtitle} (${st.position_str || '00:00'} / ${st.duration_str})`;
+      }
+    } else {
+      progressWrap.style.display = 'none';
+    }
+  }
+}
+
+async function seekDock(event) {
+  const wrap = document.getElementById('dock-progress-wrap');
+  const st = state.currentPlaying;
+  if (!wrap || !st || !st.duration) return;
+  const rect = wrap.getBoundingClientRect();
+  const clickX = event.clientX - rect.left;
+  const ratio = Math.max(0, Math.min(1, clickX / rect.width));
+  const targetSec = Math.round(ratio * st.duration);
+  try {
+    await api('/api/player/seek', { method: 'POST', body: JSON.stringify({ position: targetSec }) });
+    showToast(`跳转至 ${Math.floor(targetSec / 60)}:${String(targetSec % 60).padStart(2, '0')}`, 'info');
+  } catch (err) {
+    showToast(`跳转失败: ${err.message}`, 'error');
   }
 }
 

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,6 +114,7 @@ func (a *App) setRenderer(r *RendererInfo) {
 	a.renderer = r
 	a.rendererErr = ""
 	a.rendererChecked = now
+	a.rememberRendererPortLocked(portFromURL(r.ControlURL))
 	a.rendererMu.Unlock()
 
 	port := portFromURL(r.ControlURL)
@@ -144,23 +146,76 @@ func (a *App) setRendererError(err error, checked time.Time) {
 }
 
 func (a *App) discoveryLoop() {
+	failStreak := 0
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		default:
 		}
-		ctx, cancel := context.WithTimeout(a.ctx, 9*time.Second)
-		r, err := a.discoverRenderer(ctx)
-		cancel()
-		if r != nil {
-			a.setRenderer(r)
-		} else {
-			a.setRendererError(err, time.Now())
+
+		// A playback request discovers the renderer itself. Skipping the
+		// background scan while one is running keeps it from stealing the
+		// discovery lock and adding seconds to start-up latency.
+		if atomic.LoadInt32(&a.playInFlight) == 1 {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
 		}
+
+		// If the cached port still answers, a full SSDP round is pointless.
+		cachedAlive := false
+		var deadPort int
+		if r := a.currentRenderer(); r != nil {
+			if hp := hostPortFromURL(r.ControlURL); hp != "" {
+				if conn, err := net.DialTimeout("tcp4", hp, 250*time.Millisecond); err == nil {
+					conn.Close()
+					a.touchRenderer(r)
+					cachedAlive = true
+				} else {
+					// mq_player rotates its port monotonically (+1) on each restart.
+					// Pre-probe port+1 in the background so it is ready in the
+					// cache the next time ensureRenderer is called.
+					deadPort = portFromURL(r.ControlURL)
+				}
+			}
+		}
+		if deadPort > 0 {
+			go a.preProbeNextPort(deadPort)
+		}
+		if !cachedAlive {
+			ctx, cancel := context.WithTimeout(a.ctx, 9*time.Second)
+			r, err := a.discoverRenderer(ctx)
+			cancel()
+			if r != nil {
+				a.setRenderer(r)
+				failStreak = 0
+			} else {
+				a.setRendererError(err, time.Now())
+				failStreak++
+			}
+		} else {
+			failStreak = 0
+		}
+
 		delay := discoveryRetryInterval
-		if r != nil {
-			delay = 45 * time.Second
+		if a.currentRenderer() != nil {
+			// mq_player restarts often; a 15s heartbeat notices a rotated port
+			// quickly while still costing only a TCP dial.
+			delay = 15 * time.Second
+		} else {
+			// A renderer that stays gone used to be rescanned every 8s with a
+			// 9s SSDP + port sweep, which kept the CPU and Wi-Fi busy forever.
+			// Back off to one attempt per minute instead.
+			delay = reconnectDelay(failStreak-1, discoveryRetryInterval, 60*time.Second)
+			st := a.getStatus()
+			sess := a.session.snapshot()
+			if !st.Playing && !sess.Active && delay < 60*time.Second {
+				delay = 60 * time.Second
+			}
 		}
 		select {
 		case <-a.ctx.Done():
@@ -168,6 +223,24 @@ func (a *App) discoveryLoop() {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// reconnectDelay grows the interval between renderer discovery attempts so a
+// renderer that has gone away cannot saturate the CPU and Wi-Fi with SSDP
+// rounds and 10-port scans. doublings is the number of consecutive failures
+// minus one; the result is capped at max.
+func reconnectDelay(doublings int, base, max time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	d := base
+	for i := 0; i < doublings && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 var (
@@ -186,9 +259,12 @@ func hasMQueuePlayer() bool {
 	return err == nil
 }
 
-func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
+func (a *App) ensureRenderer(ctx context.Context, timeout time.Duration) (*RendererInfo, error) {
 	deadline := time.Now().Add(timeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if r := a.currentRenderer(); r != nil {
 			// Fast active probe to check if the cached renderer's TCP port is still listening
 			hp := hostPortFromURL(r.ControlURL)
@@ -204,15 +280,24 @@ func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
 			}
 		}
 
+		// mq_player rotates its UPnP port on every restart (49494 -> 49495 ...).
+		// Probing the handful of ports we have seen before takes a few
+		// milliseconds and catches the new port immediately, instead of waiting
+		// for a full SSDP + local port scan.
+		if r := a.probeKnownRendererPorts(ctx); r != nil {
+			a.setRenderer(r)
+			return r, nil
+		}
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil, errors.New("没有找到 FiiO DISC 本机的 UPnP AVTransport 服务")
 		}
-		if remaining > 2*time.Second {
-			remaining = 2 * time.Second
+		if remaining > 600*time.Millisecond {
+			remaining = 600 * time.Millisecond
 		}
-		ctx, cancel := context.WithTimeout(a.ctx, remaining)
-		r, _ := a.discoverRenderer(ctx)
+		dctx, cancel := context.WithTimeout(ctx, remaining)
+		r, _ := a.discoverRenderer(dctx)
 		cancel()
 		if r != nil {
 			a.setRenderer(r)
@@ -220,11 +305,155 @@ func (a *App) ensureRenderer(timeout time.Duration) (*RendererInfo, error) {
 		}
 
 		select {
-		case <-a.ctx.Done():
-			return nil, a.ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-time.After(80 * time.Millisecond):
 		}
 	}
+}
+
+// probeKnownRendererPorts tries the UPnP ports that were recently active plus
+// the stock mq_player range, on loopback and the first LAN address only.
+//
+// Two-phase approach:
+//  1. Fast TCP dial all candidate (ip, port) pairs in parallel (~50ms) to
+//     discard unreachable ports immediately.
+//  2. Fetch the UPnP description XML only from ports whose TCP socket is open.
+//
+// This avoids stacking N×250ms HTTP timeouts for ports that are not listening.
+func (a *App) probeKnownRendererPorts(ctx context.Context) *RendererInfo {
+	ports := a.candidateRendererPorts()
+	if len(ports) == 0 {
+		return nil
+	}
+	ips := a.localIPv4List()
+	if len(ips) > 2 {
+		ips = ips[:2]
+	}
+
+	// Phase 1: parallel TCP pre-screen – keep only ports with an open socket.
+	type ipPort struct{ ip, port string }
+	type tcpResult struct {
+		ip   string
+		port int
+		ok   bool
+	}
+	tcpCh := make(chan tcpResult, len(ports)*len(ips))
+	for _, port := range ports {
+		for _, ip := range ips {
+			go func(ip string, port int) {
+				hp := fmt.Sprintf("%s:%d", ip, port)
+				conn, err := net.DialTimeout("tcp4", hp, 150*time.Millisecond)
+				if err == nil {
+					conn.Close()
+					tcpCh <- tcpResult{ip: ip, port: port, ok: true}
+				} else {
+					tcpCh <- tcpResult{ip: ip, port: port, ok: false}
+				}
+			}(ip, port)
+		}
+	}
+	// Collect all TCP results (they complete in ~150ms regardless of count).
+	total := len(ports) * len(ips)
+	type aliveKey struct{ ip string; port int }
+	alive := make(map[aliveKey]bool, total)
+	for i := 0; i < total; i++ {
+		res := <-tcpCh
+		if res.ok {
+			alive[aliveKey{res.ip, res.port}] = true
+		}
+	}
+	if len(alive) == 0 {
+		return nil
+	}
+
+	// Phase 2: UPnP description fetch only for alive ports.
+	candidates := make([]rendererCandidate, 0, len(alive)*2)
+	for _, port := range ports { // preserve priority order
+		for _, ip := range ips {
+			if !alive[aliveKey{ip, port}] {
+				continue
+			}
+			candidates = append(candidates,
+				rendererCandidate{URL: fmt.Sprintf("http://%s:%d/description.xml", ip, port), Source: "known-port", Timeout: 250 * time.Millisecond, Priority: 0},
+				rendererCandidate{URL: fmt.Sprintf("http://%s:%d/", ip, port), Source: "known-port-root", Timeout: 250 * time.Millisecond, Priority: 1},
+			)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	r, _ := a.probeRendererCandidates(ctx, candidates, false)
+	return r
+}
+
+// preProbeNextPort speculatively probes deadPort+1 (and deadPort+2) in the
+// background because mq_player rotates its UPnP port monotonically on every
+// restart. If a renderer is found it is stored immediately so that the next
+// ensureRenderer call can return from the cached-port fast path.
+func (a *App) preProbeNextPort(deadPort int) {
+	ips := a.localIPv4List()
+	if len(ips) > 2 {
+		ips = ips[:2]
+	}
+	candidates := make([]rendererCandidate, 0, 4*len(ips))
+	for _, delta := range []int{1, 2} {
+		next := deadPort + delta
+		if next <= 0 || next > 65535 {
+			continue
+		}
+		for _, ip := range ips {
+			candidates = append(candidates,
+				rendererCandidate{URL: fmt.Sprintf("http://%s:%d/description.xml", ip, next), Source: "known-port", Timeout: 300 * time.Millisecond, Priority: 0},
+				rendererCandidate{URL: fmt.Sprintf("http://%s:%d/", ip, next), Source: "known-port-root", Timeout: 300 * time.Millisecond, Priority: 1},
+			)
+		}
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Second)
+	defer cancel()
+	r, _ := a.probeRendererCandidates(ctx, candidates, false)
+	if r != nil {
+		a.setRenderer(r)
+	}
+}
+
+func (a *App) candidateRendererPorts() []int {
+	a.rendererMu.RLock()
+	remembered := append([]int(nil), a.rendererPorts...)
+	a.rendererMu.RUnlock()
+
+	seen := make(map[int]bool, len(remembered)+4)
+	out := make([]int, 0, len(remembered)+4)
+	for _, p := range remembered {
+		if p > 0 && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, p := range listeningPorts() {
+		if p >= 49000 && p <= 50000 && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	if len(out) > 4 {
+		out = out[:4]
+	}
+	return out
+}
+
+func (a *App) rememberRendererPortLocked(port int) {
+	if port <= 0 {
+		return
+	}
+	next := make([]int, 0, 4)
+	next = append(next, port)
+	for _, p := range a.rendererPorts {
+		if p != port && len(next) < 4 {
+			next = append(next, p)
+		}
+	}
+	a.rendererPorts = next
 }
 
 func (a *App) touchRenderer(r *RendererInfo) {
@@ -312,9 +541,34 @@ func (a *App) discoverControlOnce(ctx context.Context) (string, error) {
 	}
 }
 
+// acquireDiscovery serialises renderer discovery but stays cancellable: a
+// playback request must never sit behind a background scan that is already
+// running. If ctx is cancelled while waiting, a helper releases the lock as
+// soon as it is granted so nothing stays wedged.
+func (a *App) acquireDiscovery(ctx context.Context) (func(), error) {
+	done := make(chan struct{})
+	go func() {
+		a.discoverMu.Lock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return a.discoverMu.Unlock, nil
+	case <-ctx.Done():
+		go func() {
+			<-done
+			a.discoverMu.Unlock()
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 func (a *App) discoverRenderer(ctx context.Context) (*RendererInfo, error) {
-	a.discoverMu.Lock()
-	defer a.discoverMu.Unlock()
+	release, err := a.acquireDiscovery(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// 1. First and most reliable: Stock FiiO DISC direct unicast SSDP to local Wi-Fi IP:1900
 	if control, err := a.discoverControlOnce(ctx); err == nil && control != "" {
@@ -864,6 +1118,18 @@ func (a *App) pauseRenderer(ctx context.Context, r *RendererInfo) error {
 	return err
 }
 
+func (a *App) rendererSeek(ctx context.Context, r *RendererInfo, target string) error {
+	if r == nil {
+		return errors.New("renderer 为空")
+	}
+	_, err := a.soapAction(ctx, r.ControlURL, serviceAVTransport, "Seek",
+		soapArg{"InstanceID", "0"},
+		soapArg{"Unit", "REL_TIME"},
+		soapArg{"Target", target},
+	)
+	return err
+}
+
 func (a *App) setAVTransportURI(ctx context.Context, r *RendererInfo, mediaURL, metadata string) error {
 	if r == nil {
 		return errors.New("renderer 为空")
@@ -911,16 +1177,18 @@ func (a *App) SetVolume(volume int) error {
 	if volume > 100 {
 		volume = 100
 	}
-	r, err := a.ensureRenderer(5 * time.Second)
+	ctx, ctxCancel := context.WithTimeout(a.ctx, 9*time.Second)
+	defer ctxCancel()
+	r, err := a.ensureRenderer(ctx, 5*time.Second)
 	if err != nil {
 		return err
 	}
 	if r.RenderingControlURL == "" {
 		return errors.New("播放器没有暴露 RenderingControl 服务")
 	}
-	ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)
+	sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	_, err = a.soapAction(ctx, r.RenderingControlURL, serviceRendering, "SetVolume",
+	_, err = a.soapAction(sctx, r.RenderingControlURL, serviceRendering, "SetVolume",
 		soapArg{"InstanceID", "0"}, soapArg{"Channel", "Master"}, soapArg{"DesiredVolume", strconv.Itoa(volume)})
 	if err != nil {
 		return err
@@ -935,11 +1203,20 @@ func (a *App) SetVolume(volume int) error {
 // --- Playback status polling / recovery ---
 
 func (a *App) statusPollLoop() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	stoppedCount := 0
+	failStreak := 0
+	nextProbe := time.Time{}
+	lastGen := int64(-1)
 	lastRecovery := time.Time{}
 	recoveries := 0
+	lastBreakpointSave := time.Time{}
+	lastBroadcastPlaying := false
+	lastProgressLog := time.Time{}
+	lastPlayingAt := time.Time{}
+	lastPositionInfo := time.Time{}
+	lastDurationLookup := time.Time{}
 
 	for {
 		select {
@@ -949,14 +1226,85 @@ func (a *App) statusPollLoop() {
 		}
 
 		st := a.getStatus()
-		if !st.Playing || st.ProxyURL == "" {
-			stoppedCount = 0
+		sess := a.session.snapshot()
+		now := time.Now()
+
+		// A seek is in flight. mq_player needs ~0.5s to run its debounce thread
+		// and then reopens the stream; probing UPnP inside that window is what
+		// pushed its server into the 49494 -> 49495 -> 49496 port churn.
+		if a.seekCheck.holding(now) {
 			continue
 		}
+
+		// A new play request must never inherit an old reconnect backoff.
+		if gen := a.currentPlayGen(); gen != lastGen {
+			lastGen = gen
+			failStreak = 0
+			nextProbe = time.Time{}
+		}
+
+		if st.ProxyURL == "" {
+			stoppedCount = 0
+			failStreak = 0
+			nextProbe = time.Time{}
+			if lastBroadcastPlaying {
+				lastBroadcastPlaying = false
+				a.broadcastPlaybackState("stopped", 0, 0, false)
+				go a.saveBreakpoints()
+			}
+			continue
+		}
+		// Keep polling while a podcast session is alive even if the renderer
+		// briefly reports STOPPED: that is how mq_player behaves while it
+		// rebinds its UPnP port, and it used to kill breakpoint recording.
+		if !st.Playing && !sess.Active {
+			stoppedCount = 0
+			failStreak = 0
+			nextProbe = time.Time{}
+			if lastBroadcastPlaying {
+				lastBroadcastPlaying = false
+				a.broadcastPlaybackState("stopped", 0, 0, false)
+				go a.saveBreakpoints()
+			}
+			continue
+		}
+
+		// Do not probe a dead renderer every second. This is the exact loop
+		// that produced the 14:09:41 -> 14:10:15 retry storm in the field.
+		// A user tap bypasses it: PlayStream calls ensureRenderer directly.
+		if !nextProbe.IsZero() && now.Before(nextProbe) {
+			continue
+		}
+
+		// Record a conservative fallback before touching the renderer, so a
+		// port restart cannot lose the last known position.
+		if sess.Active && sess.MediaType == "podcast" && sess.StreamURL != "" {
+			fallback := a.session.estimate(now, st.Playing)
+			if fallback >= 5 && !durationReachedEnd(fallback, sess.Duration) {
+				a.setBreakpoint(sess.StreamURL, sess.Title, fallback, sess.Duration, sess.Subtitle)
+				if now.Sub(lastBreakpointSave) > 10*time.Second {
+					lastBreakpointSave = now
+					go a.saveBreakpoints()
+				}
+			}
+		}
+
 		r := a.currentRenderer()
 		if r == nil {
-			if _, err := a.ensureRenderer(4 * time.Second); err != nil {
+			if fresh := a.probeKnownRendererPorts(a.ctx); fresh != nil {
+				a.setRenderer(fresh)
+				r = fresh
+			}
+		}
+		if r == nil {
+			if _, err := a.ensureRenderer(a.ctx, 4*time.Second); err != nil {
 				a.log.Warnf("播放中 renderer 丢失: %v", err)
+				a.mu.Lock()
+				a.status.RendererState = "RECONNECTING"
+				a.status.UpdatedAt = now.Format("2006-01-02 15:04:05")
+				a.mu.Unlock()
+				failStreak++
+				nextProbe = time.Now().Add(reconnectDelay(failStreak-1, time.Second, 60*time.Second))
 				continue
 			}
 			r = a.currentRenderer()
@@ -964,59 +1312,236 @@ func (a *App) statusPollLoop() {
 		if r == nil {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(a.ctx, 3*time.Second)
+
+		ctx, cancel := context.WithTimeout(a.ctx, 1800*time.Millisecond)
 		vals, err := a.getTransportInfo(ctx, r)
 		cancel()
-		now := time.Now()
 		if err != nil {
 			stoppedCount++
 			a.log.Warnf("查询播放器状态失败 (%d): %v", stoppedCount, err)
+			// A single probe of the known port range is much cheaper than a
+			// full SSDP scan and usually finds mq_player's new port at once.
+			if fresh := a.probeKnownRendererPorts(a.ctx); fresh != nil {
+				a.setRenderer(fresh)
+				r = fresh
+				failStreak = 0
+				nextProbe = time.Time{}
+			} else {
+				if stoppedCount >= 8 {
+					a.setRenderer(nil)
+					stoppedCount = 0
+				}
+				failStreak++
+				nextProbe = time.Now().Add(reconnectDelay(failStreak-1, time.Second, 60*time.Second))
+			}
 			a.mu.Lock()
-			a.status.RendererState = "UNKNOWN"
+			if a.status.RendererState == "" || a.status.RendererState == "PLAYING" {
+				a.status.RendererState = "RECONNECTING"
+			}
 			a.status.UpdatedAt = now.Format("2006-01-02 15:04:05")
 			a.mu.Unlock()
-			if stoppedCount >= 3 {
-				a.rendererMu.Lock()
-				a.renderer = nil
-				a.rendererMu.Unlock()
-				stoppedCount = 0
-			}
 			continue
 		}
 		stoppedCount = 0
+		failStreak = 0
+		nextProbe = time.Time{}
 		state := vals["CurrentTransportState"]
 		a.touchRenderer(r)
+
+		posSec := st.Position
+		durSec := st.Duration
+		source := "cached"
+		relPos := -1
+
+		if state == "PLAYING" || state == "PAUSED_PLAYBACK" || state == "TRANSITIONING" {
+			// The ALSA frame counter is the cheapest and most reliable clock
+			// for network streams. When it is available, poll
+			// GetPositionInfo only every 10 seconds: mq_player's SOAP server
+			// is fragile and frequent position requests contributed to its
+			// UPnP port restarts. Without a PCM clock we still need every
+			// second to fall back to RelTime.
+			pcmPos, pcmOK := 0, false
+			if state == "PLAYING" || state == "PAUSED_PLAYBACK" {
+				pcmPos, pcmOK = a.pcm.position(state)
+			}
+			if !pcmOK || now.Sub(lastPositionInfo) >= 10*time.Second {
+				posCtx, posCancel := context.WithTimeout(a.ctx, 1500*time.Millisecond)
+				posVals, posErr := a.getPositionInfo(posCtx, r)
+				posCancel()
+				lastPositionInfo = now
+				if posErr == nil {
+					relPos = parseTimeSeconds(posVals["RelTime"])
+					durSec = sanitizeDuration(durSec, parseTimeSeconds(posVals["TrackDuration"]))
+				} else {
+					a.log.Debugf("GetPositionInfo 失败: %v", posErr)
+				}
+			}
+
+			// mq_player usually reports RelTime=00:00:00 for network streams,
+			// mq_player usually reports RelTime=00:00:00 for network streams,
+			// so prefer the ALSA frame counter, then RelTime, then wall clock.
+			if state == "PLAYING" || state == "PAUSED_PLAYBACK" {
+				if pcmOK {
+					posSec = pcmPos
+					source = "pcm"
+				} else if relPos > 0 {
+					posSec = relPos
+					source = "reltime"
+				} else if sess.Active && sess.SeenPlaying {
+					posSec = a.session.estimate(now, state == "PLAYING")
+					source = "wall"
+				}
+			} else if relPos > 0 {
+				posSec = relPos
+				source = "reltime"
+			} else if sess.Active && sess.SeenPlaying {
+				posSec = a.session.estimate(now, false)
+				source = "wall-hold"
+			}
+		} else if sess.Active && sess.SeenPlaying {
+			posSec = a.session.estimate(now, false)
+			source = "wall-hold"
+		}
+
+		// The UI ships a hardcoded episode list, so a tap can arrive before the
+		// background RSS refresh has finished. mq_player also reports bogus
+		// 2-6 second durations for network streams. Retry the feed lookup while
+		// the real length is unknown so the progress bar gets a usable total.
+		if sess.Active && sess.MediaType == "podcast" && durSec < minimumPlausibleDuration && now.Sub(lastDurationLookup) >= 3*time.Second {
+			lastDurationLookup = now
+			if d := a.findPodcastDuration(sess.StreamURL, sess.Title); d != "" {
+				if sec := parseTimeSeconds(d); sec >= minimumPlausibleDuration {
+					durSec = sec
+					a.session.setDuration(sec)
+					a.log.Infof("[Duration] 从订阅源补全时长: %s -> %s", sess.Title, formatDisplayTime(sec))
+				}
+			}
+		}
+
+		if durSec > 0 && posSec > durSec {
+			posSec = durSec
+		}
+		if posSec < 0 {
+			posSec = 0
+		}
+
+		if now.Sub(lastProgressLog) >= 5*time.Second {
+			lastProgressLog = now
+			a.log.Debugf("[Progress] state=%s src=%s pos=%d dur=%d rel=%d", state, source, posSec, durSec, relPos)
+		}
+
 		a.mu.Lock()
 		a.status.RendererState = state
 		a.status.UpdatedAt = now.Format("2006-01-02 15:04:05")
+		a.status.Position = posSec
+		a.status.Duration = durSec
+		a.status.PositionStr = formatDisplayTime(posSec)
+		a.status.DurationStr = formatDisplayTime(durSec)
+
+		ended := false
 		switch state {
 		case "PLAYING", "TRANSITIONING":
 			a.status.Playing = true
+			lastPlayingAt = now
 		case "PAUSED_PLAYBACK", "PAUSED_RECORDING":
 			a.status.Playing = false
 		case "STOPPED", "NO_MEDIA_PRESENT":
-			a.status.Playing = false
-			if a.status.Type == "radio" {
-				a.status.Error = "播放器已停止（" + state + "）"
+			if a.status.Type == "podcast" && sess.Active {
+				if durationReachedEnd(posSec, durSec) || sess.EOF {
+					ended = true
+					a.status.Playing = false
+					a.status.Error = ""
+				} else if sess.SeenPlaying && now.Sub(lastPlayingAt) < 10*time.Second {
+					// mq_player is rebinding its UPnP port. Keep the UI
+					// session alive while the recovery loop reconnects.
+					a.status.Playing = true
+					a.status.RendererState = "RECONNECTING"
+					a.status.Error = ""
+				} else {
+					a.status.Playing = false
+					a.status.Error = ""
+				}
 			} else {
-				// A podcast reaching EOF normally reports STOPPED. Do not
-				// mislabel that as a failure or replay it from the start.
-				a.status.Error = ""
+				a.status.Playing = false
+				if a.status.Type == "radio" {
+					a.status.Error = "播放器已停止（" + state + "）"
+				} else {
+					a.status.Error = ""
+				}
 			}
 		}
+		isPlaying := a.status.Playing
+		mediaType := a.status.Type
 		a.mu.Unlock()
 
-		if (state == "STOPPED" || state == "NO_MEDIA_PRESENT") && st.Type == "radio" {
-			if now.Sub(lastRecovery) > 45*time.Second && recoveries < 3 {
-				lastRecovery = now
-				recoveries++
-				a.log.Warnf("播放器在播放过程中停止，尝试恢复 (%d/3)", recoveries)
-				go a.recoverPlayback(r)
+		if state == "PAUSED_PLAYBACK" || state == "PAUSED_RECORDING" {
+			a.session.setPaused(true)
+		} else {
+			a.session.setPaused(false)
+		}
+		if state == "PLAYING" {
+			a.session.markPlaying(now)
+		}
+		if sess.Active {
+			a.session.update(posSec, durSec, now)
+		}
+
+		lastBroadcastPlaying = isPlaying
+		a.broadcastPlaybackState(mediaType, posSec, durSec, isPlaying)
+
+		// 播客断点记录与完成清理
+		if ended {
+			a.clearBreakpoint(sess.StreamURL, sess.Title, sess.Subtitle)
+			a.session.stop()
+			a.pcm.reset(0)
+			if now.Sub(lastBreakpointSave) > 5*time.Second {
+				lastBreakpointSave = now
+				go a.saveBreakpoints()
+			}
+		} else if mediaType == "podcast" && sess.Active {
+			if durationReachedEnd(posSec, durSec) {
+				a.clearBreakpoint(sess.StreamURL, sess.Title, sess.Subtitle)
+				a.session.stop()
+				if now.Sub(lastBreakpointSave) > 5*time.Second {
+					lastBreakpointSave = now
+					go a.saveBreakpoints()
+				}
+			} else if posSec >= 5 {
+				a.setBreakpoint(sess.StreamURL, sess.Title, posSec, durSec, sess.Subtitle)
+				if now.Sub(lastBreakpointSave) > 10*time.Second {
+					lastBreakpointSave = now
+					go a.saveBreakpoints()
+				}
+			}
+		}
+
+		if (state == "STOPPED" || state == "NO_MEDIA_PRESENT") && !ended {
+			if mediaType == "radio" {
+				if now.Sub(lastRecovery) > 45*time.Second && recoveries < 3 {
+					lastRecovery = now
+					recoveries++
+					a.log.Warnf("播放器在播放过程中停止，尝试恢复 (%d/3)", recoveries)
+					go a.recoverPlayback(r)
+				}
+			} else if mediaType == "podcast" && sess.Active {
+				if now.Sub(lastRecovery) > 15*time.Second && recoveries < 3 {
+					lastRecovery = now
+					recoveries++
+					a.log.Warnf("播客播放器意外停止，尝试从断点恢复 (%d/3)", recoveries)
+					go a.recoverPlayback(r)
+				}
 			}
 		} else if state == "PLAYING" {
 			recoveries = 0
 		}
 	}
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (a *App) recoverPlayback(r *RendererInfo) {
@@ -1051,6 +1576,27 @@ func (a *App) recoverPlayback(r *RendererInfo) {
 	a.status.Playing = true
 	a.status.Error = ""
 	a.mu.Unlock()
+	a.session.clearEOF()
+
+	// A podcast that was interrupted mid-episode must resume at the saved
+	// position, not at 00:00. Re-issue the seek after the renderer is up.
+	sess := a.session.snapshot()
+	if sess.Active && sess.MediaType == "podcast" && sess.LastPos >= 5 {
+		target := formatRendererSeekTarget(sess.LastPos)
+		time.Sleep(500 * time.Millisecond)
+		for attempt := 0; attempt < 2; attempt++ {
+			seekCtx, seekCancel := context.WithTimeout(a.ctx, 3*time.Second)
+			err := a.rendererSeek(seekCtx, r, target)
+			seekCancel()
+			if err == nil {
+				a.pcm.setSeekTarget(sess.LastPos)
+				a.log.Infof("恢复播放：已跳转到断点 %s (%d秒, UPnP REL_TIME: %s)", formatDisplayTime(sess.LastPos), sess.LastPos, target)
+				break
+			}
+			a.log.Warnf("恢复播放 Seek 失败 (%d/2): %v", attempt+1, err)
+			time.Sleep(400 * time.Millisecond)
+		}
+	}
 }
 
 func xmlEscape(s string) string {

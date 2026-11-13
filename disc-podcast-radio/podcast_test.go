@@ -80,3 +80,42 @@ func TestParseFeedStreamAtom(t *testing.T) {
 		t.Errorf("Episodes[0].AudioURL = %q, want %q", feed.Episodes[0].AudioURL, "http://example.com/atom1.mp3")
 	}
 }
+
+func TestFeedEpisodesEqual(t *testing.T) {
+	ep1 := []PodcastItem{
+		{Title: "第1集", AudioURL: "http://example.com/1.mp3", Duration: "10:00", Downloaded: false},
+		{Title: "第2集", AudioURL: "http://example.com/2.mp3", Duration: "20:00", Downloaded: false},
+	}
+	ep2 := []PodcastItem{
+		{Title: "第1集", AudioURL: "http://example.com/1.mp3", Duration: "10:00", Downloaded: false},
+		{Title: "第2集", AudioURL: "http://example.com/2.mp3", Duration: "20:00", Downloaded: false},
+	}
+	if !feedEpisodesEqual(ep1, ep2) {
+		t.Errorf("feedEpisodesEqual should be true for identical lists")
+	}
+
+	// Different length
+	ep3 := append([]PodcastItem(nil), ep1...)
+	ep3 = append(ep3, PodcastItem{Title: "第3集", AudioURL: "http://example.com/3.mp3"})
+	if feedEpisodesEqual(ep1, ep3) {
+		t.Errorf("feedEpisodesEqual should be false for different lengths")
+	}
+
+	// Different title
+	ep4 := []PodcastItem{
+		{Title: "第1集（修订）", AudioURL: "http://example.com/1.mp3", Duration: "10:00", Downloaded: false},
+		{Title: "第2集", AudioURL: "http://example.com/2.mp3", Duration: "20:00", Downloaded: false},
+	}
+	if feedEpisodesEqual(ep1, ep4) {
+		t.Errorf("feedEpisodesEqual should be false for modified episode title")
+	}
+
+	// Different URL
+	ep5 := []PodcastItem{
+		{Title: "第1集", AudioURL: "http://example.com/1-new.mp3", Duration: "10:00", Downloaded: false},
+		{Title: "第2集", AudioURL: "http://example.com/2.mp3", Duration: "20:00", Downloaded: false},
+	}
+	if feedEpisodesEqual(ep1, ep5) {
+		t.Errorf("feedEpisodesEqual should be false for modified audio URL")
+	}
+}

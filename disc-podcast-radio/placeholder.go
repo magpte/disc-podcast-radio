@@ -525,7 +525,7 @@ func (a *App) playMediaEntry(ctx context.Context, entry *MediaEntry) error {
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
 
-	r, err := a.ensureRenderer(9 * time.Second)
+	r, err := a.ensureRenderer(ctx, 9*time.Second)
 	if err != nil {
 		msg := "未找到播放器: " + err.Error()
 		a.setStatusError(msg)

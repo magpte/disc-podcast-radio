@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -36,6 +35,7 @@ type OnlineIPCManager struct {
 	activeFeedID string
 	currentItems []OnlineItem
 	lastReqText  string
+	lastReqMTime time.Time // mtime of the last processed request file
 	revision     int
 }
 
@@ -45,9 +45,8 @@ func (a *App) startOnlineIPC() {
 	ipcMgr.app = a
 	_ = os.MkdirAll(onlineMusicDir, 0755)
 
-	// Keep nowPlayingLoop for updating nowplaying info, but avoid stealing /tmp/disc-online-music/request
-	// as pure text menu uses /tmp/disc-podcast-radio/play_cmd directly.
 	go ipcMgr.nowPlayingLoop()
+	go ipcMgr.requestLoop() // Fix A: requestLoop was defined but never started
 }
 
 func (mgr *OnlineIPCManager) requestLoop() {
@@ -65,6 +64,7 @@ func (mgr *OnlineIPCManager) requestLoop() {
 }
 
 func (mgr *OnlineIPCManager) pollRequest() {
+	fi, statErr := os.Stat(onlineReqFile)
 	data, err := os.ReadFile(onlineReqFile)
 	if err != nil || len(data) == 0 {
 		return
@@ -75,11 +75,22 @@ func (mgr *OnlineIPCManager) pollRequest() {
 	}
 
 	mgr.mu.Lock()
-	if text == mgr.lastReqText {
+	// Fix B: also compare mtime so that re-navigating to the same view
+	// (same request text, new file write) is never silently dropped.
+	mtime := time.Time{}
+	if statErr == nil {
+		mtime = fi.ModTime()
+	}
+	sameText := text == mgr.lastReqText
+	sameMTime := !mtime.IsZero() && !mtime.After(mgr.lastReqMTime)
+	if sameText && sameMTime {
 		mgr.mu.Unlock()
 		return
 	}
 	mgr.lastReqText = text
+	if !mtime.IsZero() {
+		mgr.lastReqMTime = mtime
+	}
 	mgr.mu.Unlock()
 
 	mgr.handleRequest(text)
@@ -344,11 +355,7 @@ func (mgr *OnlineIPCManager) handlePlayIndex(idx int) {
 	mgr.app.log.Infof("[OnlineIPC] 用户在屏幕点击序号 %d: Title=%s Type=%s", idx, item.Title, item.Type)
 
 	if item.Type == "station" {
-		go func() {
-			if err := mgr.app.PlayStream(context.Background(), item.URL, item.Title, item.Subtitle, item.Cover, "radio"); err != nil {
-				mgr.app.log.Errorf("[OnlineIPC] 播放网络电台失败: %v", err)
-			}
-		}()
+		mgr.app.playInBackground(item.URL, item.Title, item.Subtitle, item.Cover, "radio", "OnlineIPC")
 	} else if item.Type == "feed" {
 		// User tapped a podcast feed. If in feed list, load its episodes and start playing latest episode
 		mgr.app.mu.RLock()
@@ -364,20 +371,14 @@ func (mgr *OnlineIPCManager) handlePlayIndex(idx int) {
 
 		if feed != nil && len(feed.Episodes) > 0 {
 			ep := feed.Episodes[0]
-			go func() {
-				if err := mgr.app.PlayStream(context.Background(), ep.AudioURL, ep.Title, feed.Title, feed.Cover, "podcast"); err != nil {
-					mgr.app.log.Errorf("[OnlineIPC] 播放播客首集失败: %v", err)
-				}
-			}()
+			feedTitle := feed.Title
+			feedCover := feed.Cover
+			mgr.app.playInBackground(ep.AudioURL, ep.Title, feedTitle, feedCover, "podcast", "OnlineIPC")
 			// Switch screen view to episode list
 			mgr.handlePodcastTracks("0", feed.ID)
 		}
 	} else if item.Type == "episode" {
-		go func() {
-			if err := mgr.app.PlayStream(context.Background(), item.URL, item.Title, item.Subtitle, item.Cover, "podcast"); err != nil {
-				mgr.app.log.Errorf("[OnlineIPC] 播放播客单集失败: %v", err)
-			}
-		}()
+		mgr.app.playInBackground(item.URL, item.Title, item.Subtitle, item.Cover, "podcast", "OnlineIPC")
 	}
 	_ = view
 }

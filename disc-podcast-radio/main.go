@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,17 +17,23 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 const (
-	appVersion = "1.2.5"
+	appVersion = "1.3.0"
 	appName    = "DISC Podcast & Radio"
 	userAgent  = "Mozilla/5.0 (Linux; FiiO DISC) DISC-Podcast-Radio/" + appVersion
 )
+
+// errPlaySuperseded is returned when a newer play request arrived before this
+// one could reach the renderer. Callers treat it as "silently dropped".
+var errPlaySuperseded = errors.New("播放请求已被更新的指令取代")
 
 //go:embed web/*
 var webFS embed.FS
@@ -89,8 +96,22 @@ type PlayerStatus struct {
 	UPnPPort      int    `json:"upnp_port"`
 	RendererState string `json:"renderer_state,omitempty"`
 	RendererURI   string `json:"renderer_uri,omitempty"`
+	Position      int    `json:"position"`
+	Duration      int    `json:"duration"`
+	PositionStr   string `json:"position_str,omitempty"`
+	DurationStr   string `json:"duration_str,omitempty"`
 	Error         string `json:"error,omitempty"`
 	UpdatedAt     string `json:"updated_at,omitempty"`
+}
+
+type Breakpoint struct {
+	Key       string    `json:"key,omitempty"`
+	StreamURL string    `json:"stream_url"`
+	Title     string    `json:"title"`
+	Subtitle  string    `json:"subtitle,omitempty"`
+	Position  int       `json:"position"` // 秒数
+	Duration  int       `json:"duration"` // 秒数
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type DownloadTask struct {
@@ -153,6 +174,7 @@ type App struct {
 	renderer        *RendererInfo
 	rendererErr     string
 	rendererChecked time.Time
+	rendererPorts   []int
 	discoverMu      sync.Mutex
 	settings        appSettings
 
@@ -167,6 +189,7 @@ type App struct {
 	playMu          sync.Mutex
 	playCancel      context.CancelFunc
 	playCancelMu    sync.Mutex
+	playSeq         int64
 	playlistMu      sync.Mutex
 	playlistRoot    string
 	playlistFiles   []string
@@ -177,11 +200,27 @@ type App struct {
 	insecureClient *http.Client
 	soapClient     *http.Client
 
-	lastProbe       string
-	lastStreamError string
-	activeStreams   int32
+	lastProbe         string
+	lastStreamError   string
+	activeStreams     int32
+	playInFlight      int32
+	mediaSaveMu       sync.Mutex
 	currentCoverBytes []byte
 	currentCoverMu    sync.RWMutex
+
+	breakpointMu sync.RWMutex
+	breakpoints  map[string]Breakpoint
+	bpDirty      bool
+
+	seekMu          sync.Mutex
+	lastSeekSec     int
+	lastSeekAt      time.Time
+	lastFeedRefresh time.Time
+
+	session playbackSession
+	pcm     pcmClock
+
+	seekCheck seekCheckState
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -299,15 +338,16 @@ var defaultPodcasts = []PodcastFeed{
 func NewApp(dataDir string, port int, logger *Logger) *App {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		dataDir:   dataDir,
-		port:      port,
-		log:       logger,
-		downloads: make(map[string]*DownloadTask),
-		media:     make(map[string]*MediaEntry),
-		feedCache: make(map[string]cachedFeed),
-		ctx:       ctx,
-		cancel:    cancel,
-		start:     time.Now(),
+		dataDir:     dataDir,
+		port:        port,
+		log:         logger,
+		downloads:   make(map[string]*DownloadTask),
+		media:       make(map[string]*MediaEntry),
+		feedCache:   make(map[string]cachedFeed),
+		breakpoints: make(map[string]Breakpoint),
+		ctx:         ctx,
+		cancel:      cancel,
+		start:       time.Now(),
 	}
 	a.status.Volume = 100
 	a.client, a.insecureClient = newHTTPClients()
@@ -348,8 +388,13 @@ func (a *App) Init() error {
 		}
 	}
 
-	// Podcasts
-	if err := loadJSON(filepath.Join(a.dataDir, "podcasts.json"), &a.podcasts); err != nil {
+	// Podcasts. Remember whether this is a fresh install before the defaults
+	// file is created: on a fresh install a TF-card list is authoritative,
+	// while on an upgrade the already-persisted online list must win.
+	podcastsPath := filepath.Join(a.dataDir, "podcasts.json")
+	_, podcastsStatErr := os.Stat(podcastsPath)
+	firstRun := os.IsNotExist(podcastsStatErr)
+	if err := loadJSON(podcastsPath, &a.podcasts); err != nil {
 		a.log.Warnf("读取播客列表失败，将使用内置列表: %v", err)
 	}
 	if len(a.podcasts) == 0 {
@@ -383,6 +428,7 @@ func (a *App) Init() error {
 	}
 
 	a.loadSettings()
+	a.loadBreakpoints()
 	a.log.Infof("%s %s 启动，端口 %d，数据目录 %s", appName, appVersion, a.port, a.dataDir)
 	a.log.Infof("运行模式: 原生流媒体屏幕UI交互模式 (免TF卡占位符I/O)，媒体登记 %d 条，电台 %d 个，播客 %d 个", len(a.media), len(a.stations), len(a.podcasts))
 
@@ -390,7 +436,7 @@ func (a *App) Init() error {
 	go a.cleanupLegacyPlaceholders()
 
 	// 初始化 TF 卡订阅及电台文件同步 (podcasts.txt / radios.txt)
-	a.initTFCardSync()
+	a.initTFCardSync(firstRun)
 	go a.tfCardWatcherLoop()
 
 	go a.discoveryLoop()
@@ -577,6 +623,15 @@ func (a *App) mergeDefaultPodcasts() bool {
 	return changed
 }
 
+func (a *App) hasNetworkIP() bool {
+	for _, ip := range a.localIPv4List() {
+		if ip != "127.0.0.1" && !strings.HasPrefix(ip, "127.") {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) startupTasks() {
 	select {
 	case <-a.ctx.Done():
@@ -586,114 +641,330 @@ func (a *App) startupTasks() {
 
 	go a.logStartupDiagnostics()
 
-	for {
+	// 阶段一：保底填充无单集的空白订阅（如首次启动或通过 TF 卡新添加但未拉取的播客）
+	for attempt := 0; attempt < 3; attempt++ {
 		a.mu.RLock()
 		feeds := append([]PodcastFeed(nil), a.podcasts...)
 		a.mu.RUnlock()
 
-		allSuccess := true
+		hasMissing := false
 		for _, f := range feeds {
 			if len(f.Episodes) > 0 {
 				continue
 			}
-			allSuccess = false
+			hasMissing = true
 			select {
 			case <-a.ctx.Done():
 				return
-			case <-time.After(1 * time.Second):
+			case <-time.After(500 * time.Millisecond):
 			}
-			ctx, cancel := context.WithTimeout(a.ctx, 45*time.Second)
+			ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 			feed, err := a.FetchPodcastEpisodes(ctx, f.URL, true)
 			cancel()
 			if err != nil {
-				a.log.Warnf("后台刷新内置播客《%s》失败: %v", f.Title, err)
+				a.log.Warnf("[Startup] 补充拉取空白播客《%s》失败: %v", f.Title, err)
 				continue
 			}
-			a.log.Infof("后台刷新内置播客《%s》完成，%d 集", feed.Title, len(feed.Episodes))
-			a.exportEpisodesText()
+			a.log.Infof("[Startup] 补充拉取空白播客《%s》完成，共 %d 集", feed.Title, len(feed.Episodes))
 		}
-		a.exportEpisodesText()
-		if allSuccess {
-			a.log.Infof("内置播客后台刷新完毕，已通过流媒体屏幕UI及Web就绪。")
-			return
+		if hasMissing {
+			a.exportEpisodesText()
+			a.syncPodcastsToTF()
+			a.log.Infof("[Startup] 空白播客单集补充完毕，已实时导出屏幕选单与持久化快照")
+		}
+		if !hasMissing {
+			break
 		}
 		select {
 		case <-a.ctx.Done():
 			return
-		case <-time.After(20 * time.Second):
+		case <-time.After(10 * time.Second):
 		}
+	}
+
+	// 阶段二：后台网络监控与常驻增量同步
+	// 无论开机初期网络是否就绪，持续后台监测，在 Wi-Fi 建立连接后立即拉取，随后每20分钟定时增量同步
+	go func() {
+		for {
+			if a.hasNetworkIP() {
+				break
+			}
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-time.After(4 * time.Second):
+			}
+		}
+		a.log.Infof("[StartupRefresh] 检测到 Wi-Fi 网络已连接，执行首次播客更新...")
+		a.refreshSubscribedFeeds()
+
+		ticker := time.NewTicker(20 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+				if a.hasNetworkIP() {
+					a.refreshSubscribedFeeds()
+				}
+			}
+		}
+	}()
+}
+
+func (a *App) refreshSubscribedFeeds() {
+	if !a.hasNetworkIP() {
+		return
+	}
+	a.mu.RLock()
+	feeds := append([]PodcastFeed(nil), a.podcasts...)
+	a.mu.RUnlock()
+
+	if len(feeds) == 0 {
+		return
+	}
+
+	a.log.Infof("[FeedSync] 开始执行播客增量刷新（共 %d 个订阅源）...", len(feeds))
+	var updatedCount int
+
+	for _, f := range feeds {
+		if strings.HasPrefix(f.URL, "http://127.0.0.1") {
+			continue
+		}
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(1000 * time.Millisecond): // 节奏控制：每个订阅间隔 1 秒
+		}
+
+		oldLen := len(f.Episodes)
+		var oldTopTitle string
+		if oldLen > 0 {
+			oldTopTitle = f.Episodes[0].Title
+		}
+
+		ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+		feed, err := a.FetchPodcastEpisodes(ctx, f.URL, true)
+		cancel()
+
+		if err != nil {
+			a.log.Warnf("[FeedSync] 播客《%s》增量刷新失败 (保留本地旧数据): %v", f.Title, err)
+			continue
+		}
+
+		newLen := len(feed.Episodes)
+		var newTopTitle string
+		if newLen > 0 {
+			newTopTitle = feed.Episodes[0].Title
+		}
+
+		if newLen != oldLen || newTopTitle != oldTopTitle {
+			a.log.Infof("[FeedSync] 播客《%s》发现新节目更新: %s (原 %d 集 -> 现 %d 集)", feed.Title, newTopTitle, oldLen, newLen)
+			updatedCount++
+		} else {
+			a.log.Infof("[FeedSync] 播客《%s》已是最新内容 (%d 集)", feed.Title, newLen)
+		}
+	}
+
+	a.lastFeedRefresh = time.Now()
+	if updatedCount > 0 {
+		a.exportEpisodesText()
+		a.log.Infof("[FeedSync] 播客增量更新完毕: %d 个订阅发现新节目，屏幕选单已同步更新。", updatedCount)
+
+		// if the screen is currently showing a podcast list via IPC,
+		// push fresh data immediately so the user sees up-to-date content
+		ipcMgr.mu.Lock()
+		activeSource := ipcMgr.activeSource
+		activeView := ipcMgr.activeView
+		activeFeedID := ipcMgr.activeFeedID
+		ipcMgr.mu.Unlock()
+
+		switch {
+		case activeSource == "podcast" && activeView == "feeds":
+			go ipcMgr.handlePodcastAccount("refresh")
+		case activeSource == "podcast" && activeView == "episodes" && activeFeedID != "":
+			go ipcMgr.handlePodcastTracks("refresh", activeFeedID)
+		}
+	} else {
+		a.log.Infof("[FeedSync] 播客增量更新完毕: 所有订阅内容均已是最新状态。")
 	}
 }
 
 func (a *App) commandListenerLoop() {
 	cmdDir := "/tmp/disc-podcast-radio"
 	cmdFile := filepath.Join(cmdDir, "play_cmd")
+	seekFile := filepath.Join(cmdDir, "seek_cmd")
 	_ = os.MkdirAll(cmdDir, 0755)
 
-	ticker := time.NewTicker(150 * time.Millisecond)
+	// 250ms keeps tap latency imperceptible while cutting the stat() rate by
+	// 40% versus the old 150ms loop. A partially written command is still
+	// retried (maxParseRetries * 250ms = 2s) before it is dropped.
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastCmd string
+	// The UI signals every tap by writing this file, including a second tap on
+	// the same episode, so there is deliberately no "same content twice" filter
+	// here: the file itself is the event. A partially written command is retried
+	// for a few ticks before it is dropped.
+	const maxParseRetries = 8
+	retries := 0
 
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
+			// 检查屏幕 UI 触发的主动刷新播客单集指令
+			refreshFile := filepath.Join(cmdDir, "refresh_requested")
+			if _, rerr := os.Stat(refreshFile); rerr == nil {
+				_ = os.Remove(refreshFile)
+				a.log.Infof("[ScreenUI] 收到屏幕主动刷新请求")
+				if a.hasNetworkIP() && time.Since(a.lastFeedRefresh) > 30*time.Second {
+					go a.refreshSubscribedFeeds()
+				}
+			}
+
+			// 优先检查屏幕 UI 点击跳转进度指令
+			if seekData, serr := os.ReadFile(seekFile); serr == nil && len(seekData) > 0 {
+				_ = os.Remove(seekFile)
+				seekText := strings.TrimSpace(string(seekData))
+				if seekText != "" {
+					sec := parseTimeSeconds(seekText)
+					if sec >= 0 {
+						a.log.Infof("[ScreenUI] 收到进度跳转指令: %s (%d 秒)", seekText, sec)
+						go func(targetSec int) {
+							if err := a.Seek(targetSec); err != nil {
+								a.log.Warnf("[ScreenUI] 执行跳转失败: %v", err)
+							}
+						}(sec)
+					}
+				}
+			}
+
 			data, err := os.ReadFile(cmdFile)
 			if err != nil || len(data) == 0 {
+				retries = 0
 				continue
 			}
 			text := strings.TrimSpace(string(data))
-			if text == "" || text == lastCmd {
+			if text == "" {
 				continue
 			}
-			lastCmd = text
-			_ = os.Remove(cmdFile)
-
 			parts := strings.Split(text, "\t")
-			if len(parts) >= 3 {
-				playType := parts[0]
-				title := parts[1]
-				url := parts[2]
-				artist := ""
-				if len(parts) >= 4 {
-					artist = parts[3]
+			if len(parts) < 3 {
+				retries++
+				if retries < maxParseRetries {
+					continue
 				}
-				if artist == "" {
-					if playType == "podcast" {
-						artist = "播客"
-					} else {
-						artist = "网络电台"
-					}
-				}
-				cover := a.findCoverForPlay(playType, title, artist, url)
-				a.log.Infof("[ScreenUI] 收到屏幕播放指令: type=%s title=%s artist=%s url=%s cover=%s", playType, title, artist, url, cover)
-				a.playCancelMu.Lock()
-				if a.playCancel != nil {
-					a.playCancel()
-				}
-				playCtx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
-				a.playCancel = cancel
-				a.playCancelMu.Unlock()
-
-				go func(ctx context.Context, pType, pTitle, pArtist, pURL, pCover string) {
-					a.playMu.Lock()
-					defer a.playMu.Unlock()
-					if ctx.Err() != nil {
-						return
-					}
-					if err := a.PlayStream(ctx, pURL, pTitle, pArtist, pCover, pType); err != nil {
-						if ctx.Err() == nil {
-							a.log.Errorf("[ScreenUI] 播放失败: %v", err)
-						} else {
-							a.log.Infof("[ScreenUI] 播放已由后续新指令取消: %s", pTitle)
-						}
-					}
-				}(playCtx, playType, title, artist, url, cover)
+				a.log.Warnf("[ScreenUI] 播放指令格式无效，已丢弃: %q", text)
+				_ = os.Remove(cmdFile)
+				retries = 0
+				continue
 			}
+			retries = 0
+			if err := os.Remove(cmdFile); err != nil && !os.IsNotExist(err) {
+				a.log.Debugf("[ScreenUI] 删除播放指令文件失败: %v", err)
+			}
+
+			playType := parts[0]
+			title := parts[1]
+			url := parts[2]
+			artist := ""
+			if len(parts) >= 4 {
+				artist = parts[3]
+			}
+			if artist == "" {
+				if playType == "podcast" {
+					artist = "播客"
+				} else {
+					artist = "网络电台"
+				}
+			}
+			cover := a.findCoverForPlay(playType, title, artist, url)
+			a.log.Infof("[ScreenUI] 收到屏幕播放指令: type=%s title=%s artist=%s url=%s cover=%s", playType, title, artist, url, cover)
+
+			ctx, cancel, gen := a.beginPlay(25 * time.Second)
+			go func(ctx context.Context, gen int64, pType, pTitle, pArtist, pURL, pCover string, cancel context.CancelFunc) {
+				defer cancel()
+				err := a.playNow(ctx, gen, pURL, pTitle, pArtist, pCover, pType)
+				if err == nil {
+					return
+				}
+				if errors.Is(err, errPlaySuperseded) {
+					a.log.Infof("[ScreenUI] 播放已由后续新指令取消: %s", pTitle)
+					return
+				}
+				if ctx.Err() == nil {
+					a.log.Errorf("[ScreenUI] 播放失败: %v", err)
+				} else {
+					a.log.Infof("[ScreenUI] 播放已由后续新指令取消: %s", pTitle)
+				}
+			}(ctx, gen, playType, title, artist, url, cover, cancel)
 		}
 	}
+}
+
+// beginPlay registers a new playback generation. Any in-flight playback is
+// cancelled and the returned context is cancelled as soon as a newer request
+// arrives, so a slow discovery cannot keep running after the user moved on.
+func (a *App) beginPlay(timeout time.Duration) (context.Context, context.CancelFunc, int64) {
+	a.playCancelMu.Lock()
+	if a.playCancel != nil {
+		a.playCancel()
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, timeout)
+	a.playSeq++
+	gen := a.playSeq
+	a.playCancel = cancel
+	a.playCancelMu.Unlock()
+	return ctx, cancel, gen
+}
+
+func (a *App) playIsCurrent(gen int64) bool {
+	a.playCancelMu.Lock()
+	defer a.playCancelMu.Unlock()
+	return a.playSeq == gen
+}
+
+func (a *App) currentPlayGen() int64 {
+	a.playCancelMu.Lock()
+	defer a.playCancelMu.Unlock()
+	return a.playSeq
+}
+
+// playNow serialises PlayStream behind playMu and drops the request when a
+// newer command superseded it while it was queued.
+func (a *App) playNow(ctx context.Context, gen int64, streamURL, title, subtitle, cover, mediaType string) error {
+	a.playMu.Lock()
+	defer a.playMu.Unlock()
+	if !a.playIsCurrent(gen) {
+		return errPlaySuperseded
+	}
+	if err := ctx.Err(); err != nil {
+		return errPlaySuperseded
+	}
+	atomic.StoreInt32(&a.playInFlight, 1)
+	defer atomic.StoreInt32(&a.playInFlight, 0)
+	return a.PlayStream(ctx, streamURL, title, subtitle, cover, mediaType)
+}
+
+// playInBackground starts a playback request that participates in the same
+// cancel/preempt chain as screen taps and HTTP calls, so two callers can never
+// mutate renderer state at the same time.
+func (a *App) playInBackground(streamURL, title, subtitle, cover, mediaType, tag string) {
+	ctx, cancel, gen := a.beginPlay(30 * time.Second)
+	go func() {
+		defer cancel()
+		err := a.playNow(ctx, gen, streamURL, title, subtitle, cover, mediaType)
+		switch {
+		case err == nil:
+		case errors.Is(err, errPlaySuperseded):
+			a.log.Infof("[%s] 播放已由更新的指令取代: %s", tag, title)
+		default:
+			a.log.Errorf("[%s] 播放失败: %s (%v)", tag, title, err)
+		}
+	}()
 }
 
 func (a *App) findCoverForPlay(playType, title, artist, streamURL string) string {
@@ -774,12 +1045,30 @@ func (a *App) exportEpisodesText() {
 
 	_ = os.WriteFile(txtFile+".next", []byte(sb.String()), 0644)
 	_ = os.Rename(txtFile+".next", txtFile)
+	a.persistUIMenuSnapshot("episodes.txt", []byte(sb.String()))
+}
+
+// persistUIMenuSnapshot stores a copy of a screen-UI text menu on NAND.
+//
+// /tmp is a tmpfs: every reboot wipes /tmp/disc-podcast-radio/episodes.txt and
+// radios.txt. Until the on-demand daemon writes them again, module-ui.so falls
+// back to the demo list compiled into it (忽左忽右 505-510, 客栈里的武林…),
+// which users see as "the old list came back after a reboot". The guard module
+// copies this snapshot back into /tmp at boot, before the first menu render.
+func (a *App) persistUIMenuSnapshot(name string, data []byte) {
+	if err := writeFileAtomic(filepath.Join(a.dataDir, name), data, 0644); err != nil && a.log != nil {
+		a.log.Warnf("保存屏幕选单快照 %s 失败: %v", name, err)
+	}
 }
 
 func (a *App) Close() {
+	a.captureCurrentBreakpointSync("shutdown")
+	a.session.stop()
 	if a.cancel != nil {
 		a.cancel()
 	}
+	_ = a.saveBreakpoints()
+	_ = os.Remove("/tmp/disc-podcast-radio/playback_state")
 	if a.log != nil {
 		a.log.Close()
 	}
@@ -870,6 +1159,9 @@ func (a *App) persistPodcastsLocked() error {
 }
 
 func (a *App) saveMedia() error {
+	a.mediaSaveMu.Lock()
+	defer a.mediaSaveMu.Unlock()
+
 	a.mu.RLock()
 	list := make([]*MediaEntry, 0, len(a.media))
 	for _, m := range a.media {
@@ -898,8 +1190,323 @@ func (a *App) maintenanceLoop() {
 			if err := a.saveMedia(); err != nil {
 				a.log.Warnf("保存媒体登记失败: %v", err)
 			}
+			if err := a.saveBreakpoints(); err != nil {
+				a.log.Warnf("保存播客断点记忆失败: %v", err)
+			}
 		}
 	}
+}
+
+// --- Breakpoints & Playback Progress ---
+
+func (a *App) loadBreakpoints() {
+	var m map[string]Breakpoint
+	path := filepath.Join(a.dataDir, "breakpoints.json")
+	if err := loadJSON(path, &m); err != nil {
+		if !os.IsNotExist(err) {
+			a.log.Warnf("读取断点记录失败: %v", err)
+		} else {
+			a.log.Infof("未找到播客断点文件，将在首次播放后创建: %s", path)
+		}
+		return
+	}
+	if m == nil {
+		m = make(map[string]Breakpoint)
+	}
+	a.breakpointMu.Lock()
+	a.breakpoints = m
+	a.bpDirty = false
+	a.breakpointMu.Unlock()
+	a.log.Infof("已载入 %d 条播客断点记忆", len(m))
+}
+
+func (a *App) saveBreakpoints() error {
+	a.breakpointMu.Lock()
+	if !a.bpDirty {
+		a.breakpointMu.Unlock()
+		return nil
+	}
+	copyMap := make(map[string]Breakpoint, len(a.breakpoints))
+	for k, v := range a.breakpoints {
+		copyMap[k] = v
+	}
+	a.bpDirty = false
+	a.breakpointMu.Unlock()
+
+	b, err := json.MarshalIndent(copyMap, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(a.dataDir, "breakpoints.json"), b, 0644)
+}
+
+// getBreakpoint accepts optional title/subtitle hints. Old files were keyed by
+// the exact stream URL; new files also carry a stable episode key and a
+// canonical URL without expiring CDN signature parameters.
+func (a *App) getBreakpoint(streamURL string, hints ...string) (Breakpoint, bool) {
+	title, subtitle := "", ""
+	if len(hints) > 0 {
+		title = hints[0]
+	}
+	if len(hints) > 1 {
+		subtitle = hints[1]
+	}
+	canonical := canonicalMediaKey(streamURL)
+	episode := episodeBreakpointKey(title, subtitle)
+
+	a.breakpointMu.RLock()
+	defer a.breakpointMu.RUnlock()
+	for _, key := range []string{streamURL, canonical, episode} {
+		if key == "" {
+			continue
+		}
+		if bp, ok := a.breakpoints[key]; ok {
+			return bp, true
+		}
+	}
+	for _, bp := range a.breakpoints {
+		if canonical != "" && canonicalMediaKey(bp.StreamURL) == canonical {
+			return bp, true
+		}
+		if episode != "" && episodeBreakpointKey(bp.Title, bp.Subtitle) == episode {
+			return bp, true
+		}
+	}
+	return Breakpoint{}, false
+}
+
+func (a *App) setBreakpoint(streamURL, title string, pos, dur int, hints ...string) {
+	if streamURL == "" || pos < 5 {
+		return
+	}
+	subtitle := ""
+	if len(hints) > 0 {
+		subtitle = hints[0]
+	}
+	key := episodeBreakpointKey(title, subtitle)
+	if key == "" {
+		key = canonicalMediaKey(streamURL)
+	}
+	if key == "" {
+		return
+	}
+	bp := Breakpoint{
+		Key:       key,
+		StreamURL: streamURL,
+		Title:     title,
+		Subtitle:  subtitle,
+		Position:  pos,
+		Duration:  dur,
+		UpdatedAt: time.Now(),
+	}
+	a.breakpointMu.Lock()
+	a.breakpoints[key] = bp
+	if canonical := canonicalMediaKey(streamURL); canonical != "" && canonical != key {
+		a.breakpoints[canonical] = bp
+	}
+	a.bpDirty = true
+	a.breakpointMu.Unlock()
+}
+
+func (a *App) clearBreakpoint(streamURL string, hints ...string) {
+	title, subtitle := "", ""
+	if len(hints) > 0 {
+		title = hints[0]
+	}
+	if len(hints) > 1 {
+		subtitle = hints[1]
+	}
+	canonical := canonicalMediaKey(streamURL)
+	episode := episodeBreakpointKey(title, subtitle)
+
+	a.breakpointMu.Lock()
+	changed := false
+	for key, bp := range a.breakpoints {
+		if key == streamURL || key == canonical || key == episode ||
+			(canonical != "" && canonicalMediaKey(bp.StreamURL) == canonical) ||
+			(episode != "" && episodeBreakpointKey(bp.Title, bp.Subtitle) == episode) {
+			delete(a.breakpoints, key)
+			changed = true
+		}
+	}
+	if changed {
+		a.bpDirty = true
+	}
+	a.breakpointMu.Unlock()
+}
+
+// captureCurrentBreakpoint persists the in-memory position before a stream is
+// replaced, stopped, or the process exits. Without this, switching episodes
+// loses everything recorded since the last 15-second poll.
+func (a *App) storeCurrentBreakpoint(reason string) bool {
+	sess := a.session.snapshot()
+	if !sess.Active || sess.MediaType != "podcast" || sess.StreamURL == "" {
+		return false
+	}
+	pos := a.session.estimate(time.Now(), !sess.Paused)
+	if pos < 5 {
+		return false
+	}
+	if durationReachedEnd(pos, sess.Duration) {
+		a.clearBreakpoint(sess.StreamURL, sess.Title, sess.Subtitle)
+		return true
+	}
+	a.setBreakpoint(sess.StreamURL, sess.Title, pos, sess.Duration, sess.Subtitle)
+	a.log.Infof("[Breakpoint] 保存断点 (%s): %s / %s -> %s", reason, sess.Title, sess.Subtitle, formatSeconds(pos))
+	return true
+}
+
+func (a *App) captureCurrentBreakpoint(reason string) {
+	if a.storeCurrentBreakpoint(reason) {
+		go func() {
+			if err := a.saveBreakpoints(); err != nil {
+				a.log.Warnf("保存播客断点记忆失败: %v", err)
+			}
+		}()
+	}
+}
+
+func (a *App) captureCurrentBreakpointSync(reason string) {
+	if a.storeCurrentBreakpoint(reason) {
+		if err := a.saveBreakpoints(); err != nil {
+			a.log.Warnf("保存播客断点记忆失败: %v", err)
+		}
+	}
+}
+
+func parseTimeSeconds(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) == 3 {
+		h, _ := strconv.Atoi(parts[0])
+		m, _ := strconv.Atoi(parts[1])
+		sec, _ := strconv.Atoi(strings.Split(parts[2], ".")[0])
+		return h*3600 + m*60 + sec
+	}
+	if len(parts) == 2 {
+		m, _ := strconv.Atoi(parts[0])
+		sec, _ := strconv.Atoi(strings.Split(parts[1], ".")[0])
+		return m*60 + sec
+	}
+	return 0
+}
+
+func formatSeconds(sec int) string {
+	if sec < 0 {
+		sec = 0
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+// formatRendererSeekTarget formats seconds into a Target string for mq_player's UPnP Seek.
+// mq_player's UPnP Seek handler parses "%d:%02d:%02d" into total_sec = (h*3600 + m*60 + s),
+// and its internal seek thread (0x5e1f14) ALREADY multiplies total_sec by 1000
+// (sll 5, subu, sll 2, addu, sll 3 == * 125 * 8 == * 1000) before passing milliseconds
+// to AudioCodecSeek in libfiio_decoder.so.
+// Therefore, standard UPnP REL_TIME "HH:MM:SS" (in seconds) must be sent!
+func formatRendererSeekTarget(sec int) string {
+	if sec <= 0 {
+		return "00:00:00"
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+func formatDisplayTime(sec int) string {
+	if sec <= 0 {
+		return "00:00"
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+func (a *App) broadcastPlaybackState(pType string, pos, dur int, playing bool) {
+	dir := "/tmp/disc-podcast-radio"
+	_ = os.MkdirAll(dir, 0755)
+	stateFile := filepath.Join(dir, "playback_state")
+	tmpFile := stateFile + ".tmp"
+
+	posStr := formatDisplayTime(pos)
+	durStr := formatDisplayTime(dur)
+	if dur <= 0 {
+		durStr = "--:--"
+	}
+	playFlag := 0
+	if playing {
+		playFlag = 1
+	}
+
+	line := fmt.Sprintf("%s\t%d\t%d\t%s\t%s\t%d\n", pType, pos, dur, posStr, durStr, playFlag)
+	if err := os.WriteFile(tmpFile, []byte(line), 0644); err == nil {
+		_ = os.Rename(tmpFile, stateFile)
+	}
+}
+
+func (a *App) Seek(targetSeconds int) error {
+	if targetSeconds < 0 {
+		targetSeconds = 0
+	}
+	a.seekMu.Lock()
+	defer a.seekMu.Unlock()
+
+	now := time.Now()
+	if a.lastSeekSec == targetSeconds && now.Sub(a.lastSeekAt) < 400*time.Millisecond {
+		a.log.Debugf("[Seek] 忽略 400ms 内重复跳转目标: %d 秒", targetSeconds)
+		return nil
+	}
+	a.lastSeekSec = targetSeconds
+	a.lastSeekAt = now
+
+	r := a.currentRenderer()
+	if r == nil {
+		ctx, cancel := context.WithTimeout(a.ctx, 4*time.Second)
+		defer cancel()
+		var err error
+		r, err = a.ensureRenderer(ctx, 3*time.Second)
+		if err != nil {
+			return fmt.Errorf("播放器未就绪: %w", err)
+		}
+	}
+	targetStr := formatRendererSeekTarget(targetSeconds)
+	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
+	defer cancel()
+	a.log.Infof("执行播放进度跳转: %s (%d 秒, UPnP REL_TIME: %s) -> %s", formatDisplayTime(targetSeconds), targetSeconds, targetStr, r.ControlURL)
+	// Arm the byte-offset verifier before the SOAP call: mq_player reopens the
+	// proxied stream about 0.5s after a seek, and that Range start is the only
+	// reliable proof of where it actually landed.
+	a.seekCheck.begin(targetSeconds)
+	if err := a.rendererSeek(ctx, r, targetStr); err != nil {
+		a.seekCheck.cancel()
+		return fmt.Errorf("跳转进度失败: %w", err)
+	}
+	a.pcm.setSeekTarget(targetSeconds)
+	a.mu.Lock()
+	a.status.Position = targetSeconds
+	a.status.PositionStr = formatDisplayTime(targetSeconds)
+	pType := a.status.Type
+	dur := a.status.Duration
+	playing := a.status.Playing
+	a.mu.Unlock()
+	a.session.update(targetSeconds, dur, time.Now())
+	a.broadcastPlaybackState(pType, targetSeconds, dur, playing)
+	go a.confirmSeek()
+	return nil
 }
 
 // --- Helpers ---
@@ -1115,6 +1722,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer app.Close()
+
+	readyFile := "/tmp/disc-podcast-radio/ready"
+	_ = os.WriteFile(readyFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644)
+	defer os.Remove(readyFile)
 
 	mux := http.NewServeMux()
 	app.RegisterRoutes(mux)

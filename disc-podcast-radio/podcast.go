@@ -18,9 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/text/encoding/htmlindex"
-	"golang.org/x/text/transform"
 )
 
 // --- RSS / Atom models ---
@@ -189,13 +186,7 @@ func parseFeedStream(r io.Reader, feedURL string, maxItems int) (*PodcastFeed, e
 
 	dec := xml.NewDecoder(br)
 	dec.Strict = false
-	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
-		enc, err := htmlindex.Get(charset)
-		if err != nil {
-			return input, nil
-		}
-		return transform.NewReader(input, enc.NewDecoder()), nil
-	}
+	dec.CharsetReader = prCharsetReader
 
 	feed := &PodcastFeed{
 		Episodes:    make([]PodcastItem, 0, maxItems),
@@ -354,13 +345,7 @@ func parseFeedDocument(body []byte) (*PodcastFeed, error) {
 
 	dec := xml.NewDecoder(bytes.NewReader(trimmed))
 	dec.Strict = false
-	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
-		enc, err := htmlindex.Get(charset)
-		if err != nil {
-			return input, nil
-		}
-		return transform.NewReader(input, enc.NewDecoder()), nil
-	}
+	dec.CharsetReader = prCharsetReader
 
 	var rss rssFeed
 	if err := dec.Decode(&rss); err == nil && rss.XMLName.Local == "rss" {
@@ -681,8 +666,14 @@ func (a *App) FetchPodcastEpisodes(ctx context.Context, feedURL string, force bo
 			if feed.ID == "" {
 				feed.ID = "pod_" + stableHash(feedURL, 12)
 			}
+			changed := !feedEpisodesEqual(a.podcasts[i].Episodes, feed.Episodes) ||
+				a.podcasts[i].Title != feed.Title ||
+				a.podcasts[i].Cover != feed.Cover
+
 			a.podcasts[i] = *feed
-			updated = true
+			if changed {
+				updated = true
+			}
 			break
 		}
 	}
@@ -698,6 +689,18 @@ func (a *App) FetchPodcastEpisodes(ctx context.Context, feedURL string, force bo
 	}
 
 	return cloneFeed(feed), nil
+}
+
+func feedEpisodesEqual(a, b []PodcastItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].AudioURL != b[i].AudioURL || a[i].Title != b[i].Title || a[i].Duration != b[i].Duration || a[i].Downloaded != b[i].Downloaded {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) episodeDownloaded(podcastTitle, episodeTitle, audioURL string) bool {

@@ -16,6 +16,37 @@ import (
 	"time"
 )
 
+// writeNetCoverAsync publishes the current cover for mq_ui without blocking the
+// playback path. The file lives on a sync-mounted filesystem, so it is written
+// to a unique temp file first and then renamed into place: mq_ui never reads a
+// half-written JPEG and concurrent taps cannot interleave.
+func (a *App) writeNetCoverAsync(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	go func() {
+		const dir = "/usr/data/fiio"
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return
+		}
+		f, err := os.CreateTemp(dir, ".net_cover-*.jpg")
+		if err != nil {
+			return
+		}
+		tmp := f.Name()
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return
+		}
+		_ = f.Close()
+		_ = os.Chmod(tmp, 0644)
+		if err := os.Rename(tmp, filepath.Join(dir, "net_cover.jpg")); err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+}
+
 // resizeImage downscales an image to fit within maxDim x maxDim while preserving aspect ratio.
 func resizeImage(src image.Image, maxDim int) image.Image {
 	b := src.Bounds()
@@ -156,8 +187,22 @@ func (a *App) asyncFetchCover(coverURL, cachePath string) {
 			if encErr := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: 88}); encErr == nil {
 				res := buf.Bytes()
 				_ = os.WriteFile(cachePath, res, 0644)
-				_ = os.MkdirAll("/usr/data/fiio", 0755)
-				_ = os.WriteFile("/usr/data/fiio/net_cover.jpg", res, 0644)
+				// Write net_cover.jpg atomically (CreateTemp + Rename) so mq_ui
+				// never reads a half-written file. This mirrors writeNetCoverAsync.
+				const netCoverDir = "/usr/data/fiio"
+				if mkErr := os.MkdirAll(netCoverDir, 0755); mkErr == nil {
+					if f, tmpErr := os.CreateTemp(netCoverDir, ".net_cover_async_*.jpg"); tmpErr == nil {
+						tmp := f.Name()
+						if _, wErr := f.Write(res); wErr == nil {
+							_ = f.Close()
+							_ = os.Chmod(tmp, 0644)
+							_ = os.Rename(tmp, filepath.Join(netCoverDir, "net_cover.jpg"))
+						} else {
+							_ = f.Close()
+							_ = os.Remove(tmp)
+						}
+					}
+				}
 				a.currentCoverMu.Lock()
 				a.currentCoverBytes = res
 				a.currentCoverMu.Unlock()

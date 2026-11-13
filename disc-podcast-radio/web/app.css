@@ -751,6 +751,32 @@ body {
   z-index: 90;
 }
 
+.dock-progress-wrap {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  overflow: hidden;
+  display: none;
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-lg);
+}
+
+.dock-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #ff8c42, #ff5c35);
+  border-radius: 2px;
+  transition: width 0.25s ease;
+}
+
+.player-dock:hover .dock-progress-wrap {
+  height: 6px;
+}
+
 .dock-cover {
   width: 44px;
   height: 44px;

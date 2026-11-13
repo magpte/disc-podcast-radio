@@ -359,21 +359,44 @@ func albumForType(mediaType string) string {
 	return "DISC 网络电台"
 }
 
-func didlMetadata(title, artist, album, cover, mediaURL, contentType string) string {
+func didlMetadata(title, artist, album, cover, mediaURL, contentType string, optionalDuration ...string) string {
 	if title == "" {
-		title = "DISC 流媒体"
+		if artist != "" {
+			title = artist
+			artist = album
+		} else {
+			title = "DISC 流媒体"
+		}
 	}
+	// In FiiO's native DLNA player screen (mq_ui 0x47785c / dlna_player.c):
+	// - 0x8de26c (28pt bold top label, main title) is updated with song_artist_name (<upnp:artist>)
+	// - 0x8de264 (22pt bottom label, subtitle) is updated with song_name (<dc:title>)
+	// To display the specific episode title or radio station name as the prominent main title
+	// on screen, and the subscription feed or category as the secondary subtitle:
+	// - Put specific program title in <upnp:artist>
+	// - Put feed/category subtitle in <dc:title> (falling back to album/title so it's never empty)
+	subTitle := artist
+	if subTitle == "" {
+		if album != "" {
+			subTitle = album
+		} else {
+			subTitle = title
+		}
+	}
+
 	mime := "audio/mpeg"
 	if contentType != "" && contentType != "application/octet-stream" {
 		mime = contentType
 	}
+	dur := "0:00:00"
+	if len(optionalDuration) > 0 && optionalDuration[0] != "" {
+		dur = optionalDuration[0]
+	}
 	var b strings.Builder
 	b.WriteString(`<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">`)
 	b.WriteString(`<item id="online" parentID="0" restricted="1">`)
-	b.WriteString("<dc:title>" + xmlEscape(title) + "</dc:title>")
-	if artist != "" {
-		b.WriteString("<upnp:artist>" + xmlEscape(artist) + "</upnp:artist>")
-	}
+	b.WriteString("<dc:title>" + xmlEscape(subTitle) + "</dc:title>")
+	b.WriteString("<upnp:artist>" + xmlEscape(title) + "</upnp:artist>")
 	if album != "" {
 		b.WriteString("<upnp:album>" + xmlEscape(album) + "</upnp:album>")
 	}
@@ -381,9 +404,41 @@ func didlMetadata(title, artist, album, cover, mediaURL, contentType string) str
 	if cover != "" && (strings.HasPrefix(cover, "http://") || strings.HasPrefix(cover, "https://")) {
 		b.WriteString("<upnp:albumArtURI>" + xmlEscape(cover) + "</upnp:albumArtURI>")
 	}
-	b.WriteString(`<res protocolInfo="http-get:*:` + mime + `:*" duration="0:00:00">` + xmlEscape(mediaURL) + `</res>`)
+	b.WriteString(`<res protocolInfo="http-get:*:` + mime + `:*" duration="` + xmlEscape(dur) + `">` + xmlEscape(mediaURL) + `</res>`)
 	b.WriteString(`</item></DIDL-Lite>`)
 	return b.String()
+}
+
+func (a *App) findPodcastDuration(streamURL, title string) string {
+	// The UI ships a hardcoded episode list whose URLs carry a uid= parameter
+	// and an expiring jt= signature, while the RSS enclosure may carry a
+	// different signature. Compare canonical keys so a signed URL still finds
+	// its episode. Title equality is the second chance: the hardcoded list and
+	// the feed use the same episode title.
+	wantKey := canonicalMediaKey(streamURL)
+	wantTitle := strings.ToLower(strings.TrimSpace(title))
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, feed := range a.podcasts {
+		for _, ep := range feed.Episodes {
+			match := wantKey != "" && canonicalMediaKey(ep.AudioURL) == wantKey
+			if !match && wantTitle != "" {
+				match = strings.EqualFold(strings.TrimSpace(ep.Title), strings.TrimSpace(title))
+			}
+			if !match {
+				continue
+			}
+			d := strings.TrimSpace(ep.Duration)
+			if d != "" {
+				sec := parseTimeSeconds(d)
+				if sec > 0 {
+					return formatSeconds(sec)
+				}
+				return d
+			}
+		}
+	}
+	return ""
 }
 
 // --- Probing ---
@@ -612,6 +667,7 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		a.setStatusError(err.Error())
 		return err
 	}
+	gen := a.currentPlayGen()
 	if title == "" {
 		title = "DISC 流媒体"
 	}
@@ -653,6 +709,17 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 			}
 		}
 	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Persist the outgoing episode before replacing it. Users normally switch
+	// episodes without pressing Stop, so relying on the 15-second poll loses
+	// the last few seconds (and often the whole episode if it was short).
+	a.captureCurrentBreakpoint("switch")
+	a.session.stop()
+	a.pcm.reset(0)
 
 	a.mu.Lock()
 	a.status.Playing = false
@@ -736,6 +803,9 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entry := a.registerMedia(mediaType, stableHash(streamURL, 20), streamURL, title, subtitle, cover, ext, ct, format)
 	a.mu.Lock()
 	if old, ok := a.media[entry.Token]; ok {
@@ -747,10 +817,22 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 		entry = &c
 	}
 	a.mu.Unlock()
-	_ = a.saveMedia()
+	// Persisting the media registry hits /usr/data (UBIFS, sync mount) and is
+	// not needed for playback: keep it off the start-up critical path.
+	go func() {
+		if err := a.saveMedia(); err != nil {
+			a.log.Warnf("保存媒体登记失败: %v", err)
+		}
+	}()
 
-	r, err := a.ensureRenderer(8 * time.Second)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r, err := a.ensureRenderer(ctx, 8*time.Second)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		msg := "未找到播放器: " + err.Error()
 		a.setStatusError(msg)
 		a.setLastStreamError(msg)
@@ -763,10 +845,11 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.status.ContentType = ct
 	a.mu.Unlock()
 
-	// Stop whatever is currently playing
-	stopCtx, stopCancel := context.WithTimeout(ctx, 2*time.Second)
-	_ = a.stopRenderer(stopCtx, r)
-	stopCancel()
+	// Do not send Stop before SetAVTransportURI. mq_player tears down and
+	// rebinds its UPnP port when it receives Stop, so the following
+	// SetAVTransportURI hits the old, already-closed port and waits for its
+	// 2-second timeout (the field logs show 12-18 second startup stalls).
+	// SetAVTransportURI replaces the current stream atomically.
 
 	// Prepare cover image and cache bytes
 	coverBytes := a.prepareCoverImage(ctx, cover, mediaType, title, subtitle)
@@ -774,69 +857,85 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.currentCoverBytes = coverBytes
 	a.currentCoverMu.Unlock()
 
-	// Write directly to /usr/data/fiio/net_cover.jpg so it is immediately available
-	_ = os.MkdirAll("/usr/data/fiio", 0755)
-	_ = os.WriteFile("/usr/data/fiio/net_cover.jpg", coverBytes, 0644)
+	// Publish the cover for mq_ui. Writing /usr/data/fiio/net_cover.jpg on the
+	// critical path costs 50-200ms on a sync-mounted filesystem, and mq_ui only
+	// needs it once the renderer is actually playing, so do it in the background
+	// with an atomic rename.
+	a.writeNetCoverAsync(coverBytes)
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	localCoverURL := fmt.Sprintf("http://127.0.0.1:%d/cover.jpg", a.port)
 	a.mu.Lock()
 	a.status.Cover = localCoverURL
 	a.mu.Unlock()
 
-	meta := didlMetadata(title, subtitle, album, localCoverURL, proxyURL, ct)
-	setCtx, setCancel := context.WithTimeout(ctx, 6*time.Second)
-	err = a.setAVTransportURI(setCtx, r, proxyURL, meta)
-	setCancel()
-	if err != nil {
-		a.log.Warnf("SetAVTransportURI 带元数据失败，尝试空元数据: %v", err)
-		retryCtx, retryCancel := context.WithTimeout(ctx, 6*time.Second)
-		err = a.setAVTransportURI(retryCtx, r, proxyURL, "")
-		retryCancel()
+	podcastDur := ""
+	initDurSec := 0
+	if mediaType == "podcast" {
+		podcastDur = a.findPodcastDuration(streamURL, subtitle)
+		if podcastDur == "" {
+			podcastDur = a.findPodcastDuration(streamURL, title)
+		}
+		if podcastDur != "" {
+			initDurSec = parseTimeSeconds(podcastDur)
+		}
 	}
-	if err != nil {
-		a.log.Warnf("设置播放地址遇到连接失败 (%v)，播放器可能刚重启或更换端口，立即重新发现…", err)
-		a.setRenderer(nil)
-		if freshR, ferr := a.ensureRenderer(6 * time.Second); ferr == nil && freshR != nil {
-			r = freshR
-			a.log.Infof("已重新发现活跃播放器: %s，立即重新下发播放地址", r.ControlURL)
-			retryCtx, retryCancel := context.WithTimeout(ctx, 6*time.Second)
-			err = a.setAVTransportURI(retryCtx, r, proxyURL, meta)
-			retryCancel()
-			if err != nil {
-				retryCtx2, retryCancel2 := context.WithTimeout(ctx, 6*time.Second)
-				err = a.setAVTransportURI(retryCtx2, r, proxyURL, "")
-				retryCancel2()
+
+	resumeSec := 0
+	if mediaType == "podcast" {
+		if bp, hasBp := a.getBreakpoint(streamURL, title, subtitle); hasBp {
+			initDurSec = sanitizeDuration(initDurSec, bp.Duration)
+			if bp.Position >= 5 && !durationReachedEnd(bp.Position, bp.Duration) {
+				resumeSec = bp.Position
+				a.log.Infof("[Breakpoint] 找到历史播放断点: %s / %s -> %s (%d 秒)", title, subtitle, formatSeconds(resumeSec), resumeSec)
 			}
 		}
 	}
+
+	meta := didlMetadata(title, subtitle, album, localCoverURL, proxyURL, ct, podcastDur)
+	err = a.setAVTransportWithRetry(ctx, r, proxyURL, meta)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.log.Warnf("设置播放地址失败 (%v)，播放器可能刚重启或更换端口，立即重新发现…", err)
+		a.setRenderer(nil)
+		if freshR, ferr := a.ensureRenderer(ctx, 4*time.Second); ferr == nil && freshR != nil {
+			r = freshR
+			a.log.Infof("已重新发现活跃播放器: %s，立即重新下发播放地址", r.ControlURL)
+			err = a.setAVTransportWithRetry(ctx, r, proxyURL, meta)
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		msg := "设置播放地址失败: " + err.Error()
 		a.setStatusError(msg)
 		a.setLastStreamError(msg)
 		return errors.New(msg)
 	}
 
-	playCtx, playCancel := context.WithTimeout(ctx, 6*time.Second)
-	err = a.rendererPlay(playCtx, r)
-	playCancel()
+	err = a.rendererPlayWithRetry(ctx, r)
 	if err != nil {
-		a.log.Warnf("启动播放遇到连接断开，重试 Play: %v", err)
-		retryPlayCtx, retryPlayCancel := context.WithTimeout(ctx, 6*time.Second)
-		err = a.rendererPlay(retryPlayCtx, r)
-		retryPlayCancel()
-	}
-	if err != nil {
-		a.log.Warnf("启动播放重试失败 (%v)，尝试重新发现播放器并恢复播放…", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.log.Warnf("启动播放失败 (%v)，尝试重新发现播放器并恢复播放…", err)
 		a.setRenderer(nil)
-		if freshR, ferr := a.ensureRenderer(6 * time.Second); ferr == nil && freshR != nil {
+		if freshR, ferr := a.ensureRenderer(ctx, 4*time.Second); ferr == nil && freshR != nil {
 			r = freshR
-			_ = a.setAVTransportURI(ctx, r, proxyURL, meta)
-			playRetryCtx2, playRetryCancel2 := context.WithTimeout(ctx, 6*time.Second)
-			err = a.rendererPlay(playRetryCtx2, r)
-			playRetryCancel2()
+			_ = a.setAVTransportWithRetry(ctx, r, proxyURL, meta)
+			err = a.rendererPlayWithRetry(ctx, r)
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		msg := "启动播放失败: " + err.Error()
 		a.setStatusError(msg)
 		a.setLastStreamError(msg)
@@ -848,16 +947,206 @@ func (a *App) PlayStream(ctx context.Context, streamURL, title, subtitle, cover,
 	a.status.Error = ""
 	a.status.RendererState = "PLAYING"
 	a.status.RendererURI = proxyURL
+	a.status.Duration = initDurSec
+	if initDurSec > 0 {
+		a.status.DurationStr = formatDisplayTime(initDurSec)
+	}
+	if resumeSec > 0 {
+		a.status.Position = resumeSec
+		a.status.PositionStr = formatDisplayTime(resumeSec)
+	} else {
+		a.status.Position = 0
+		a.status.PositionStr = "00:00"
+	}
 	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	a.mu.Unlock()
+
+	a.session.start(mediaType, streamURL, title, subtitle, resumeSec, initDurSec)
+	a.pcm.reset(resumeSec)
+
+	a.broadcastPlaybackState(mediaType, a.status.Position, a.status.Duration, true)
 
 	// Remove any online-music session files so native DLNA UI and stream audio info are fully visible
 	_ = os.Remove("/tmp/disc-online-music/session")
 	_ = os.Remove("/tmp/disc-online-music/active")
 	_ = os.Remove("/tmp/disc-online-music/nowplaying")
 
-	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s cover=%s", title, subtitle, r.ControlURL, proxyURL, localCoverURL)
+	// 若存在断点且为播客，起播后等待 renderer 真正进入 PLAYING 再恢复断点位置。
+	// 只延时 600ms 发一次 Seek 在 mq_player 上几乎必然失败：此时它还在缓冲，
+	// 会返回成功但忽略跳转，或者直接返回 TRANSITIONING 错误。
+	if resumeSec > 0 {
+		go a.resumeAtBreakpoint(r, proxyURL, resumeSec, gen)
+	}
+
+	a.log.Infof("开始播放: %s / %s  renderer=%s proxy=%s cover=%s resume=%ds", title, subtitle, r.ControlURL, proxyURL, localCoverURL, resumeSec)
 	return nil
+}
+
+// resumeAtBreakpoint waits until mq_player reports PLAYING, then retries Seek.
+// A Seek sent during TRANSITIONING is frequently accepted but ignored, which is
+// why the old fixed 600ms delay never restored the breakpoint.
+func (a *App) resumeAtBreakpoint(r *RendererInfo, proxyURL string, targetSec int, gen int64) {
+	if r == nil || targetSec <= 0 {
+		return
+	}
+	deadline := time.Now().Add(12 * time.Second)
+	// mq_player keeps reporting PLAYING from the previous session for a moment
+	// after SetAVTransportURI, so a Seek sent the instant we see PLAYING is
+	// silently dropped (field log 1.2.24: attempt 1 restarted at byte 0, attempt
+	// 2 two seconds later worked). Require a short settle window before the
+	// first attempt so the renderer has actually torn down and reopened.
+	settle := time.Now().Add(1500 * time.Millisecond)
+	playing := false
+	for time.Now().Before(deadline) {
+		if !a.playIsCurrent(gen) {
+			return
+		}
+		st := a.getStatus()
+		if st.ProxyURL != proxyURL {
+			return
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 1200*time.Millisecond)
+		vals, err := a.getTransportInfo(ctx, r)
+		cancel()
+		if err == nil && vals["CurrentTransportState"] == "PLAYING" &&
+			!time.Now().Before(settle) {
+			playing = true
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !playing {
+		a.log.Warnf("[Breakpoint] 等待播放器进入 PLAYING 超时，仍尝试恢复断点 %s", formatSeconds(targetSec))
+	}
+
+	targetStr := formatRendererSeekTarget(targetSec)
+	for attempt := 1; attempt <= 3; attempt++ {
+		if !a.playIsCurrent(gen) {
+			return
+		}
+		st := a.getStatus()
+		if st.ProxyURL != proxyURL {
+			return
+		}
+		a.log.Infof("[Breakpoint] 正在自动恢复断点播放 (%d/3): %s (%d 秒, UPnP REL_TIME: %s)", attempt, formatDisplayTime(targetSec), targetSec, targetStr)
+		a.seekCheck.begin(targetSec)
+		ctx, cancel := context.WithTimeout(a.ctx, 3*time.Second)
+		err := a.rendererSeek(ctx, r, targetStr)
+		cancel()
+		if err == nil {
+			// A 200 response only means "request received". Verify the byte
+			// offset mq_player actually reopens the stream at before claiming
+			// the breakpoint was restored.
+			ok, _, start := a.seekCheck.verdict()
+			if ok {
+				a.pcm.setSeekTarget(targetSec)
+				a.mu.Lock()
+				a.status.Position = targetSec
+				a.status.PositionStr = formatDisplayTime(targetSec)
+				dur := a.status.Duration
+				a.mu.Unlock()
+				a.session.update(targetSec, dur, time.Now())
+				a.broadcastPlaybackState("podcast", targetSec, dur, true)
+				a.log.Infof("[Breakpoint] 已恢复到断点位置: %s", formatDisplayTime(targetSec))
+				return
+			}
+			a.log.Warnf("[Breakpoint] 第 %d 次跳转未生效: 播放器从 %d 字节重播", attempt, start)
+		} else {
+			a.seekCheck.cancel()
+			a.log.Warnf("[Breakpoint] 自动恢复断点播放失败 (%d/3): %v", attempt, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Every attempt was verified against the proxy byte offset: the renderer
+	// really is back at the head of the file, so show that instead of the
+	// stale target.
+	a.pcm.reset(0)
+	a.mu.Lock()
+	a.status.Position = 0
+	a.status.PositionStr = "00:00"
+	dur := a.status.Duration
+	a.mu.Unlock()
+	a.session.update(0, dur, time.Now())
+	a.broadcastPlaybackState("podcast", 0, dur, true)
+	a.log.Warnf("[Breakpoint] 自动恢复断点失败，已从头播放")
+}
+
+func isTransientSOAPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "context deadline exceeded") || strings.Contains(s, "timeout") {
+		// The request was accepted but mq_player did not answer before the
+		// deadline. Resending it restarts its buffering and makes startup much
+		// slower; the caller will rediscover the new port instead.
+		return false
+	}
+	return strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "network is unreachable")
+}
+
+// setAVTransportWithRetry delivers the stream to a renderer that may be in the
+// middle of a restart. Only short connection failures are retried: a 4-second
+// context deadline used to be retried three times, producing the 12-second
+// stalls visible in the field logs while mq_player had already moved to a new
+// port. The 2nd/3rd attempts drop DIDL-Lite metadata because some builds reject
+// it while they are still coming up.
+func (a *App) setAVTransportWithRetry(ctx context.Context, r *RendererInfo, proxyURL, meta string) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(120 * time.Millisecond):
+			}
+		}
+		payload := meta
+		if attempt > 0 {
+			payload = ""
+		}
+		actx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err = a.setAVTransportURI(actx, r, proxyURL, payload)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if !isTransientSOAPError(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// rendererPlayWithRetry absorbs the short "connection refused" window while
+// mq_player finishes restarting on the same port.
+func (a *App) rendererPlayWithRetry(ctx context.Context, r *RendererInfo) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(120 * time.Millisecond):
+			}
+		}
+		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err = a.rendererPlay(pctx, r)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if !isTransientSOAPError(err) {
+			return err
+		}
+	}
+	return err
 }
 
 // waitForPlayback checks if renderer enters PLAYING non-destructively for placeholder or transition checks
@@ -890,6 +1179,9 @@ func (a *App) waitForPlayback(ctx context.Context, r *RendererInfo, expectedURI 
 }
 
 func (a *App) StopPlay() error {
+	a.captureCurrentBreakpointSync("stop")
+	a.session.stop()
+	a.pcm.reset(0)
 	a.mu.Lock()
 	a.status.Playing = false
 	a.status.Error = ""
@@ -921,6 +1213,7 @@ func (a *App) handleAudio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := strings.TrimPrefix(r.URL.Path, "/audio/")
+
 	token := strings.SplitN(base, ".", 2)[0]
 	entry := a.lookupMedia(token)
 	if entry == nil {
@@ -929,6 +1222,9 @@ func (a *App) handleAudio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.log.Infof("音频代理开始: %s type=%s ext=%s ua=%q range=%q", entry.Title, entry.ContentType, entry.Ext, r.UserAgent(), r.Header.Get("Range"))
+	// Feed the seek verifier: a seek that landed correctly reopens the stream
+	// at the target byte offset, a failed one restarts at the mdat header.
+	a.seekCheck.note(r.Header.Get("Range"))
 	atomic.AddInt32(&a.activeStreams, 1)
 	defer atomic.AddInt32(&a.activeStreams, -1)
 	start := time.Now()
@@ -940,6 +1236,12 @@ func (a *App) handleAudio(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "音频代理失败: "+err.Error(), http.StatusBadGateway)
 		}
 		return
+	}
+	if r.Method == http.MethodGet && cw.n > 0 && entry.Kind == "podcast" {
+		// The proxy reached the end of the episode. The renderer may still be
+		// draining its buffer, so only mark EOF here; the status loop decides
+		// when it is safe to clear the breakpoint.
+		a.session.markEOF()
 	}
 	a.log.Infof("音频代理结束: %s (%d 字节, %s)", entry.Title, cw.n, time.Since(start).Round(time.Millisecond))
 }
@@ -973,8 +1275,8 @@ func (a *App) streamEntry(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return a.serveHLS(ctx, w, r, entry, target)
 	}
 
-
-	resp, err := a.openUpstream(ctx, target, r.Header.Get("Range"))
+	rangeHeader := r.Header.Get("Range")
+	resp, err := a.openUpstream(ctx, target, rangeHeader)
 	if err != nil {
 		return err
 	}
@@ -1203,7 +1505,6 @@ func ffmpegBinary() string {
 	}
 	return ""
 }
-
 
 // --- Playlist / HLS parsing ---
 

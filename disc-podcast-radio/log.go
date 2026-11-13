@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,29 +17,63 @@ type LogEntry struct {
 	Message string `json:"message"`
 }
 
-// Logger writes to stderr (captured by disc-runtime) and to a rotating file.
+// Logger writes to stderr (captured by the launcher) and to a rotating file.
 // The in-memory ring is exposed through /api/logs so failures can be diagnosed
 // without SSH access.
+//
+// The TF card copy is never written from the caller's goroutine: /usr/data and
+// the exFAT card can stall for hundreds of milliseconds, and every log call
+// would otherwise serialise behind the same mutex (HTTP handlers included).
+// Lines are queued on a bounded channel and flushed by tfLoop in batches.
 type Logger struct {
 	mu        sync.Mutex
 	ring      []LogEntry
+	ringStart int
 	max       int
 	file      *os.File
 	path      string
 	fileSize  int64
-	tfFile    *os.File
-	tfSize    int64
-	tfChecked time.Time
+
+	tfCh      chan string
+	tfStop    chan struct{}
+	tfDone    chan struct{}
+	tfDropped int32
+
+	// debug is off by default. The field logs showed that per-request and
+	// per-probe debug lines were the bulk of the flash writes (four sinks per
+	// line: ring, service.log, stderr and the TF card batch) without helping
+	// diagnosis. Set DISC_LOG_DEBUG=1 in the launcher to re-enable them.
+	debug bool
 }
 
 const (
 	logMaxEntries = 2000
 	logMaxBytes   = 2 * 1024 * 1024
-	tfLogPath     = "/tmp/sdcard/disc-podcast-radio.log"
+
+	tfCardDir   = "/tmp/sdcard"
+	tfLogPath   = tfCardDir + "/disc-podcast-radio.log"
+	tfQueueLen  = 2048
+	tfBatchMax  = 32 * 1024
+	tfFlushTick = 300 * time.Millisecond
 )
 
+func debugLoggingEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DISC_LOG_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 func NewLogger(dataDir string) *Logger {
-	l := &Logger{max: logMaxEntries, path: filepath.Join(dataDir, "service.log")}
+	l := &Logger{
+		max:    logMaxEntries,
+		path:   filepath.Join(dataDir, "service.log"),
+		tfCh:   make(chan string, tfQueueLen),
+		tfStop: make(chan struct{}),
+		tfDone: make(chan struct{}),
+		debug:  debugLoggingEnabled(),
+	}
 	if err := os.MkdirAll(dataDir, 0755); err == nil {
 		if f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 			l.file = f
@@ -47,43 +82,118 @@ func NewLogger(dataDir string) *Logger {
 			}
 		}
 	}
-	l.checkTFLogLocked()
+	go l.tfLoop()
 	return l
 }
 
-func (l *Logger) checkTFLogLocked() {
-	l.tfChecked = time.Now()
-	if l.tfFile != nil {
-		return
-	}
-	st, err := os.Stat("/tmp/sdcard")
-	if err != nil || !st.IsDir() {
-		return
-	}
-	f, err := os.OpenFile(tfLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err == nil {
-		l.tfFile = f
-		if s, err := f.Stat(); err == nil {
-			l.tfSize = s.Size()
+// tfLoop owns the TF card file descriptor. Nothing else may touch it, so the
+// slow exFAT writes never hold l.mu and never block a request handler.
+func (l *Logger) tfLoop() {
+	defer close(l.tfDone)
+
+	var (
+		f         *os.File
+		size      int64
+		lastCheck time.Time
+	)
+	buf := make([]byte, 0, tfBatchMax+8192)
+
+	openIfNeeded := func() {
+		if f != nil {
+			return
+		}
+		// /tmp/sdcard is mounted (or remounted) asynchronously at boot.
+		if time.Since(lastCheck) < 3*time.Second {
+			return
+		}
+		lastCheck = time.Now()
+		st, err := os.Stat(tfCardDir)
+		if err != nil || !st.IsDir() {
+			return
+		}
+		nf, err := os.OpenFile(tfLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			return
+		}
+		f = nf
+		size = 0
+		if s, err := nf.Stat(); err == nil {
+			size = s.Size()
 		}
 	}
-}
 
-func (l *Logger) rotateTFLocked() {
-	if l.tfFile == nil {
-		return
+	var rotate func()
+	rotate = func() {
+		if f == nil {
+			return
+		}
+		_ = f.Close()
+		f = nil
+		backup := tfLogPath + ".1"
+		_ = os.Remove(backup)
+		_ = os.Rename(tfLogPath, backup)
+		lastCheck = time.Time{}
+		openIfNeeded()
+		size = 0
 	}
-	_ = l.tfFile.Close()
-	backup := tfLogPath + ".1"
-	_ = os.Remove(backup)
-	_ = os.Rename(tfLogPath, backup)
-	f, err := os.OpenFile(tfLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		l.tfFile = nil
-		return
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		openIfNeeded()
+		if f == nil {
+			buf = buf[:0]
+			return
+		}
+		n, err := f.Write(buf)
+		if err != nil {
+			_ = f.Close()
+			f = nil
+			buf = buf[:0]
+			return
+		}
+		size += int64(n)
+		buf = buf[:0]
+		if size > logMaxBytes {
+			rotate()
+		}
 	}
-	l.tfFile = f
-	l.tfSize = 0
+
+	ticker := time.NewTicker(tfFlushTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case line := <-l.tfCh:
+			if len(buf)+len(line) > tfBatchMax {
+				flush()
+			}
+			buf = append(buf, line...)
+		case <-ticker.C:
+			flush()
+		case <-l.tfStop:
+			// Drain what is still queued, then leave.
+			for {
+				select {
+				case line := <-l.tfCh:
+					if len(buf)+len(line) > tfBatchMax {
+						flush()
+					}
+					buf = append(buf, line...)
+					continue
+				default:
+				}
+				break
+			}
+			flush()
+			if f != nil {
+				_ = f.Close()
+				f = nil
+			}
+			return
+		}
+	}
 }
 
 func (l *Logger) write(level, msg string) {
@@ -95,13 +205,7 @@ func (l *Logger) write(level, msg string) {
 	line := fmt.Sprintf("%s [%s] %s\n", entry.Time, level, msg)
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.ring = append(l.ring, entry)
-	if len(l.ring) > l.max {
-		copy(l.ring, l.ring[len(l.ring)-l.max:])
-		l.ring = l.ring[:l.max]
-	}
+	l.appendRingLocked(entry)
 
 	_, _ = os.Stderr.WriteString(line)
 	if l.file != nil {
@@ -113,22 +217,28 @@ func (l *Logger) write(level, msg string) {
 			l.rotateLocked()
 		}
 	}
+	l.mu.Unlock()
 
-	// Also write to TF card (/tmp/sdcard/disc-podcast-radio.log)
-	if time.Since(l.tfChecked) > 3*time.Second {
-		l.checkTFLogLocked()
+	// The TF copy is best effort: drop the line instead of blocking the caller.
+	select {
+	case l.tfCh <- line:
+	default:
+		atomic.AddInt32(&l.tfDropped, 1)
 	}
-	if l.tfFile != nil {
-		n, err := l.tfFile.WriteString(line)
-		if err != nil {
-			_ = l.tfFile.Close()
-			l.tfFile = nil
-		} else {
-			l.tfSize += int64(n)
-			if l.tfSize > logMaxBytes {
-				l.rotateTFLocked()
-			}
-		}
+}
+
+func (l *Logger) appendRingLocked(entry LogEntry) {
+	if l.max <= 0 {
+		return
+	}
+	if len(l.ring) < l.max {
+		l.ring = append(l.ring, entry)
+		return
+	}
+	l.ring[l.ringStart] = entry
+	l.ringStart++
+	if l.ringStart >= l.max {
+		l.ringStart = 0
 	}
 }
 
@@ -151,6 +261,9 @@ func (l *Logger) rotateLocked() {
 }
 
 func (l *Logger) Debugf(format string, args ...interface{}) {
+	if !l.debug {
+		return
+	}
 	l.write("debug", fmt.Sprintf(format, args...))
 }
 func (l *Logger) Infof(format string, args ...interface{}) {
@@ -172,9 +285,17 @@ func (l *Logger) Entries(limit int, minLevel string) []LogEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]LogEntry, 0, limit)
-	for i := len(l.ring) - 1; i >= 0 && len(out) < limit; i-- {
-		if levelRank(l.ring[i].Level) >= minRank {
-			out = append(out, l.ring[i])
+	n := len(l.ring)
+	for k := 0; k < n && len(out) < limit; k++ {
+		idx := n - 1 - k
+		if n == l.max {
+			idx = l.ringStart - 1 - k
+			if idx < 0 {
+				idx += l.max
+			}
+		}
+		if levelRank(l.ring[idx].Level) >= minRank {
+			out = append(out, l.ring[idx])
 		}
 	}
 	return out
@@ -183,6 +304,7 @@ func (l *Logger) Entries(limit int, minLevel string) []LogEntry {
 func (l *Logger) Clear() {
 	l.mu.Lock()
 	l.ring = nil
+	l.ringStart = 0
 	l.mu.Unlock()
 }
 
@@ -193,17 +315,28 @@ func (l *Logger) File() string {
 	return l.path
 }
 
+// DroppedTFLines reports how many log lines were discarded because the TF card
+// writer could not keep up. A non-zero value means the card is too slow.
+func (l *Logger) DroppedTFLines() int {
+	if l == nil {
+		return 0
+	}
+	return int(atomic.LoadInt32(&l.tfDropped))
+}
+
 func (l *Logger) Close() {
 	l.mu.Lock()
 	if l.file != nil {
 		_ = l.file.Close()
 		l.file = nil
 	}
-	if l.tfFile != nil {
-		_ = l.tfFile.Close()
-		l.tfFile = nil
-	}
 	l.mu.Unlock()
+
+	if l.tfStop != nil {
+		close(l.tfStop)
+		<-l.tfDone
+		l.tfStop = nil
+	}
 }
 
 func levelRank(level string) int {

@@ -29,6 +29,7 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/player/play", a.handlePlay)
 	mux.HandleFunc("/api/player/stop", a.handleStop)
 	mux.HandleFunc("/api/player/volume", a.handleVolume)
+	mux.HandleFunc("/api/player/seek", a.handleSeek)
 	mux.HandleFunc("/api/radio/list", a.handleRadioList)
 	mux.HandleFunc("/api/radio/add", a.handleRadioAdd)
 	mux.HandleFunc("/api/radio/delete", a.handleRadioDelete)
@@ -132,23 +133,21 @@ func (a *App) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.playCancelMu.Lock()
-	if a.playCancel != nil {
-		a.playCancel()
-	}
-	ctx, cancel := context.WithTimeout(a.ctx, 55*time.Second)
-	a.playCancel = cancel
-	a.playCancelMu.Unlock()
+	a.mu.Lock()
+	a.status.Playing = false
+	a.status.Type = body.Type
+	a.status.Title = body.Title
+	a.status.SubTitle = body.Subtitle
+	a.status.Cover = body.Cover
+	a.status.StreamURL = streamURL
+	a.status.RendererState = "CONNECTING"
+	a.status.Error = ""
+	a.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+	st := a.status
+	a.mu.Unlock()
 
-	a.playMu.Lock()
-	defer a.playMu.Unlock()
-	defer cancel()
-	if err := a.PlayStream(ctx, streamURL, body.Title, body.Subtitle, body.Cover, body.Type); err != nil {
-		a.log.Warnf("播放请求失败: %s (%v)", streamURL, err)
-		writeJSON(w, http.StatusBadGateway, map[string]interface{}{"success": false, "error": err.Error(), "status": a.getStatus()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "status": a.getStatus()})
+	a.playInBackground(streamURL, body.Title, body.Subtitle, body.Cover, body.Type, "api-play")
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "status": st})
 }
 
 func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +179,43 @@ func (a *App) handleVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "volume": body.Volume})
+}
+
+func (a *App) handleSeek(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		posStr := r.URL.Query().Get("position")
+		if posStr == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "缺少 position 参数"})
+			return
+		}
+		sec := parseTimeSeconds(posStr)
+		if err := a.Seek(sec); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "position": sec})
+		return
+	}
+	if !onlyMethods(w, r, http.MethodPost) {
+		return
+	}
+	var body struct {
+		Position int    `json:"position"`
+		Target   string `json:"target"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "请求 JSON 无效"})
+		return
+	}
+	sec := body.Position
+	if sec <= 0 && body.Target != "" {
+		sec = parseTimeSeconds(body.Target)
+	}
+	if err := a.Seek(sec); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "position": sec})
 }
 
 // --- Radio ---
@@ -233,6 +269,7 @@ func (a *App) handleRadioAdd(w http.ResponseWriter, r *http.Request) {
 			station = a.stations[i]
 			_ = a.persistStationsLocked()
 			a.mu.Unlock()
+			a.syncRadiosToTF()
 			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "station": station, "updated": true})
 			return
 		}
@@ -246,6 +283,7 @@ func (a *App) handleRadioAdd(w http.ResponseWriter, r *http.Request) {
 	a.stations = append(a.stations, station)
 	_ = a.persistStationsLocked()
 	a.mu.Unlock()
+	a.syncRadiosToTF()
 	a.log.Infof("添加电台: %s (%s) %s", station.Name, station.Category, station.URL)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "station": station, "updated": false})
 }
@@ -281,6 +319,7 @@ func (a *App) handleRadioDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "没有找到该电台"})
 		return
 	}
+	a.syncRadiosToTF()
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
@@ -370,6 +409,7 @@ func (a *App) handlePodcastSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.persistPodcastsLocked()
 	a.mu.Unlock()
+	a.syncPodcastsToTF()
 	a.log.Infof("订阅播客: 《%s》 %s (%d 集)", feed.Title, feed.URL, len(feed.Episodes))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -439,6 +479,7 @@ func (a *App) handlePodcastDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "没有找到该订阅"})
 		return
 	}
+	a.syncPodcastsToTF()
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
@@ -498,9 +539,10 @@ func (a *App) handleLogs(w http.ResponseWriter, r *http.Request) {
 	level := r.URL.Query().Get("level")
 	entries := a.log.Entries(limit, level)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"entries": entries,
-		"count":   len(entries),
-		"file":    a.log.File(),
+		"entries":    entries,
+		"count":      len(entries),
+		"file":       a.log.File(),
+		"tf_dropped": a.log.DroppedTFLines(),
 	})
 }
 
@@ -857,4 +899,3 @@ func (a *App) handleCover(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
-

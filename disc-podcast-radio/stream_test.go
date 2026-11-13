@@ -71,3 +71,34 @@ func TestAppActiveStreamsAtomic(t *testing.T) {
 	}
 }
 
+func TestDIDLMetadataTitleAndArtistMapping(t *testing.T) {
+	// Episode title must be placed in <upnp:artist> (FiiO 28pt top main label 0x8de26c)
+	// Subscription/feed title must be placed in <dc:title> (FiiO 22pt bottom subtitle label 0x8de264)
+	meta := didlMetadata("第100期: 聊聊AI", "科技早知道", "DISC 播客", "", "http://127.0.0.1:8080/stream", "audio/mpeg")
+	if !bytes.Contains([]byte(meta), []byte("<dc:title>科技早知道</dc:title>")) {
+		t.Errorf("expected <dc:title> to contain feed subtitle '科技早知道', got: %s", meta)
+	}
+	if !bytes.Contains([]byte(meta), []byte("<upnp:artist>第100期: 聊聊AI</upnp:artist>")) {
+		t.Errorf("expected <upnp:artist> to contain episode title '第100期: 聊聊AI', got: %s", meta)
+	}
+
+	// Radio with category
+	metaRadio := didlMetadata("中国之声", "国家台", "DISC 网络电台", "", "http://127.0.0.1:8080/stream", "audio/mpeg")
+	if !bytes.Contains([]byte(metaRadio), []byte("<dc:title>国家台</dc:title>")) {
+		t.Errorf("expected <dc:title> to contain category '国家台', got: %s", metaRadio)
+	}
+	if !bytes.Contains([]byte(metaRadio), []byte("<upnp:artist>中国之声</upnp:artist>")) {
+		t.Errorf("expected <upnp:artist> to contain station name '中国之声', got: %s", metaRadio)
+	}
+
+	// Empty subtitle fallback
+	metaFallback := didlMetadata("中国之声", "", "DISC 网络电台", "", "http://127.0.0.1:8080/stream", "audio/mpeg")
+	if !bytes.Contains([]byte(metaFallback), []byte("<dc:title>DISC 网络电台</dc:title>")) {
+		t.Errorf("expected <dc:title> fallback to album 'DISC 网络电台', got: %s", metaFallback)
+	}
+	if !bytes.Contains([]byte(metaFallback), []byte("<upnp:artist>中国之声</upnp:artist>")) {
+		t.Errorf("expected <upnp:artist> to contain station name '中国之声', got: %s", metaFallback)
+	}
+}
+
+
